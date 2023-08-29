@@ -2,8 +2,8 @@
 
 from django.contrib import admin
 
-import plugin.models as models
 import plugin.registry as pl_registry
+from plugin import models
 
 
 def plugin_update(queryset, new_status: bool):
@@ -56,6 +56,7 @@ class PluginConfigAdmin(admin.ModelAdmin):
     list_filter = ['active']
     actions = [plugin_activate, plugin_deactivate, ]
     inlines = [PluginSettingInline, ]
+    exclude = ['metadata', ]
 
 
 class NotificationUserSettingAdmin(admin.ModelAdmin):

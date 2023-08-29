@@ -11,7 +11,8 @@ import order.tasks
 from common.models import InvenTreeSetting, NotificationMessage
 from company.models import Company
 from InvenTree import status_codes as status
-from order.models import (SalesOrder, SalesOrderAllocation, SalesOrderLineItem,
+from order.models import (SalesOrder, SalesOrderAllocation,
+                          SalesOrderExtraLine, SalesOrderLineItem,
                           SalesOrderShipment)
 from part.models import Part
 from stock.models import StockItem
@@ -25,33 +26,37 @@ class SalesOrderTest(TestCase):
         'users',
     ]
 
-    def setUp(self):
+    @classmethod
+    def setUpTestData(cls):
         """Initial setup for this set of unit tests"""
         # Create a Company to ship the goods to
-        self.customer = Company.objects.create(name="ABC Co", description="My customer", is_customer=True)
+        cls.customer = Company.objects.create(name="ABC Co", description="My customer", is_customer=True)
 
         # Create a Part to ship
-        self.part = Part.objects.create(name='Spanner', salable=True, description='A spanner that I sell')
+        cls.part = Part.objects.create(name='Spanner', salable=True, description='A spanner that I sell')
 
         # Create some stock!
-        self.Sa = StockItem.objects.create(part=self.part, quantity=100)
-        self.Sb = StockItem.objects.create(part=self.part, quantity=200)
+        cls.Sa = StockItem.objects.create(part=cls.part, quantity=100)
+        cls.Sb = StockItem.objects.create(part=cls.part, quantity=200)
 
         # Create a SalesOrder to ship against
-        self.order = SalesOrder.objects.create(
-            customer=self.customer,
+        cls.order = SalesOrder.objects.create(
+            customer=cls.customer,
             reference='SO-1234',
             customer_reference='ABC 55555'
         )
 
         # Create a Shipment against this SalesOrder
-        self.shipment = SalesOrderShipment.objects.create(
-            order=self.order,
+        cls.shipment = SalesOrderShipment.objects.create(
+            order=cls.order,
             reference='SO-001',
         )
 
         # Create a line item
-        self.line = SalesOrderLineItem.objects.create(quantity=50, order=self.order, part=self.part)
+        cls.line = SalesOrderLineItem.objects.create(quantity=50, order=cls.order, part=cls.part)
+
+        # Create an extra line
+        cls.extraline = SalesOrderExtraLine.objects.create(quantity=1, order=cls.order, reference="Extra line")
 
     def test_so_reference(self):
         """Unit tests for sales order generation"""
@@ -97,7 +102,7 @@ class SalesOrderTest(TestCase):
         self.assertEqual(self.line.allocated_quantity(), 0)
         self.assertEqual(self.line.fulfilled_quantity(), 0)
         self.assertFalse(self.line.is_fully_allocated())
-        self.assertFalse(self.line.is_over_allocated())
+        self.assertFalse(self.line.is_overallocated())
 
         self.assertTrue(self.order.is_pending)
         self.assertFalse(self.order.is_fully_allocated())
@@ -252,6 +257,13 @@ class SalesOrderTest(TestCase):
         # Shipment should have default reference of '1'
         self.assertEqual('1', order_2.pending_shipments()[0].reference)
 
+    def test_shipment_delivery(self):
+        """Test the shipment delivery settings"""
+
+        # Shipment delivery date should be empty before setting date
+        self.assertIsNone(self.shipment.delivery_date)
+        self.assertFalse(self.shipment.is_delivered())
+
     def test_overdue_notification(self):
         """Test overdue sales order notification"""
 
@@ -292,3 +304,20 @@ class SalesOrderTest(TestCase):
 
         # However *no* notification should have been generated for the creating user
         self.assertFalse(messages.filter(user__pk=3).exists())
+
+    def test_metadata(self):
+        """Unit tests for the metadata field."""
+        for model in [SalesOrder, SalesOrderLineItem, SalesOrderExtraLine, SalesOrderShipment]:
+            p = model.objects.first()
+
+            self.assertIsNone(p.get_metadata('test'))
+            self.assertEqual(p.get_metadata('test', backup_value=123), 123)
+
+            # Test update via the set_metadata() method
+            p.set_metadata('test', 3)
+            self.assertEqual(p.get_metadata('test'), 3)
+
+            for k in ['apple', 'banana', 'carrot', 'carrot', 'banana']:
+                p.set_metadata(k, k)
+
+            self.assertEqual(len(p.metadata.keys()), 4)

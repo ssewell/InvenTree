@@ -1,6 +1,6 @@
 name: 'Setup Enviroment'
-description: 'Setup the enviroment for general InvenTree tests'
-author: 'inventree'
+description: 'Setup the environment for general InvenTree tests'
+author: 'InvenTree'
 inputs:
     python:
         required: false
@@ -62,7 +62,7 @@ runs:
         with:
           node-version: ${{ env.node_version }}
           cache: 'npm'
-      - name: Intall npm packages
+      - name: Install npm packages
         if: ${{ inputs.npm == 'true' }}
         shell: bash
         run: npm install

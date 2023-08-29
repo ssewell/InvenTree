@@ -7,13 +7,18 @@ from django.conf import settings
 from django.conf.urls.static import static
 from django.contrib import admin
 from django.urls import include, path, re_path
+from django.views.decorators.csrf import csrf_exempt
 from django.views.generic.base import RedirectView
 
-from rest_framework.documentation import include_docs_urls
+from dj_rest_auth.registration.views import (ConfirmEmailView,
+                                             SocialAccountDisconnectView,
+                                             SocialAccountListView)
+from drf_spectacular.views import SpectacularAPIView, SpectacularRedocView
+from sesame.views import LoginView
 
 from build.api import build_api_urls
 from build.urls import build_urls
-from common.api import common_api_urls, settings_api_urls
+from common.api import admin_api_urls, common_api_urls, settings_api_urls
 from common.urls import common_urls
 from company.api import company_api_urls
 from company.urls import (company_urls, manufacturer_part_urls,
@@ -29,20 +34,27 @@ from report.api import report_api_urls
 from stock.api import stock_api_urls
 from stock.urls import stock_urls
 from users.api import user_urls
+from web.urls import urlpatterns as platform_urls
 
-from .api import InfoView, NotFoundView
-from .views import (AboutView, AppearanceSelectView, CurrencyRefreshView,
-                    CustomConnectionsView, CustomEmailView, CustomLoginView,
+from .api import APISearchView, InfoView, NotFoundView
+from .magic_login import GetSimpleLoginView
+from .social_auth_urls import SocialProvierListView, social_auth_urlpatterns
+from .views import (AboutView, AppearanceSelectView, CustomConnectionsView,
+                    CustomEmailView, CustomLoginView,
                     CustomPasswordResetFromKeyView,
                     CustomSessionDeleteOtherView, CustomSessionDeleteView,
-                    CustomTwoFactorRemove, DatabaseStatsView, DynamicJsView,
-                    EditUserView, IndexView, NotificationsView, SearchView,
-                    SetPasswordView, SettingsView, auth_request)
+                    DatabaseStatsView, DynamicJsView, EditUserView, IndexView,
+                    NotificationsView, SearchView, SetPasswordView,
+                    SettingsView, auth_request)
 
 admin.site.site_header = "InvenTree Admin"
 
 
 apipatterns = [
+
+    # Global search
+    path('search/', APISearchView.as_view(), name='api-search'),
+
     re_path(r'^settings/', include(settings_api_urls)),
     re_path(r'^part/', include(part_api_urls)),
     re_path(r'^bom/', include(bom_api_urls)),
@@ -53,15 +65,34 @@ apipatterns = [
     re_path(r'^label/', include(label_api_urls)),
     re_path(r'^report/', include(report_api_urls)),
     re_path(r'^user/', include(user_urls)),
+    re_path(r'^admin/', include(admin_api_urls)),
 
     # Plugin endpoints
     path('', include(plugin_api_urls)),
 
-    # Webhook enpoint
+    # Common endpoints endpoint
     path('', include(common_api_urls)),
+
+    # OpenAPI Schema
+    re_path('schema/', SpectacularAPIView.as_view(custom_settings={'SCHEMA_PATH_PREFIX': '/api/'}), name='schema'),
 
     # InvenTree information endpoint
     path('', InfoView.as_view(), name='api-inventree-info'),
+
+    # Auth API endpoints
+    path('auth/', include([
+        re_path(r'^registration/account-confirm-email/(?P<key>[-:\w]+)/$', ConfirmEmailView.as_view(), name='account_confirm_email'),
+        path('registration/', include('dj_rest_auth.registration.urls')),
+        path('providers/', SocialProvierListView.as_view(), name='social_providers'),
+        path('social/', include(social_auth_urlpatterns)),
+        path('social/', SocialAccountListView.as_view(), name='social_account_list'),
+        path('social/<int:pk>/disconnect/', SocialAccountDisconnectView.as_view(), name='social_account_disconnect'),
+        path('', include('dj_rest_auth.urls')),
+    ])),
+
+    # Magic login URLs
+    path("email/generate/", csrf_exempt(GetSimpleLoginView().as_view()), name="sesame-generate",),
+    path("email/login/", LoginView.as_view(), name="sesame-login"),
 
     # Unknown endpoint
     re_path(r'^.*$', NotFoundView.as_view(), name='api-404'),
@@ -72,7 +103,6 @@ settings_urls = [
     re_path(r'^i18n/?', include('django.conf.urls.i18n')),
 
     re_path(r'^appearance/?', AppearanceSelectView.as_view(), name='settings-appearance'),
-    re_path(r'^currencies-refresh/', CurrencyRefreshView.as_view(), name='settings-currencies-refresh'),
 
     # Catch any other urls
     re_path(r'^.*$', SettingsView.as_view(template_name='InvenTree/settings/settings.html'), name='settings'),
@@ -88,10 +118,11 @@ notifications_urls = [
 dynamic_javascript_urls = [
     re_path(r'^calendar.js', DynamicJsView.as_view(template_name='js/dynamic/calendar.js'), name='calendar.js'),
     re_path(r'^nav.js', DynamicJsView.as_view(template_name='js/dynamic/nav.js'), name='nav.js'),
+    re_path(r'^permissions.js', DynamicJsView.as_view(template_name='js/dynamic/permissions.js'), name='permissions.js'),
     re_path(r'^settings.js', DynamicJsView.as_view(template_name='js/dynamic/settings.js'), name='settings.js'),
 ]
 
-# These javascript files are pased through the Django translation layer
+# These javascript files are passed through the Django translation layer
 translated_javascript_urls = [
     re_path(r'^api.js', DynamicJsView.as_view(template_name='js/translated/api.js'), name='api.js'),
     re_path(r'^attachment.js', DynamicJsView.as_view(template_name='js/translated/attachment.js'), name='attachment.js'),
@@ -103,14 +134,19 @@ translated_javascript_urls = [
     re_path(r'^filters.js', DynamicJsView.as_view(template_name='js/translated/filters.js'), name='filters.js'),
     re_path(r'^forms.js', DynamicJsView.as_view(template_name='js/translated/forms.js'), name='forms.js'),
     re_path(r'^helpers.js', DynamicJsView.as_view(template_name='js/translated/helpers.js'), name='helpers.js'),
+    re_path(r'^index.js', DynamicJsView.as_view(template_name='js/translated/index.js'), name='index.js'),
     re_path(r'^label.js', DynamicJsView.as_view(template_name='js/translated/label.js'), name='label.js'),
     re_path(r'^model_renderers.js', DynamicJsView.as_view(template_name='js/translated/model_renderers.js'), name='model_renderers.js'),
     re_path(r'^modals.js', DynamicJsView.as_view(template_name='js/translated/modals.js'), name='modals.js'),
     re_path(r'^order.js', DynamicJsView.as_view(template_name='js/translated/order.js'), name='order.js'),
     re_path(r'^part.js', DynamicJsView.as_view(template_name='js/translated/part.js'), name='part.js'),
+    re_path(r'^purchase_order.js', DynamicJsView.as_view(template_name='js/translated/purchase_order.js'), name='purchase_order.js'),
+    re_path(r'^return_order.js', DynamicJsView.as_view(template_name='js/translated/return_order.js'), name='return_order.js'),
     re_path(r'^report.js', DynamicJsView.as_view(template_name='js/translated/report.js'), name='report.js'),
+    re_path(r'^sales_order.js', DynamicJsView.as_view(template_name='js/translated/sales_order.js'), name='sales_order.js'),
     re_path(r'^search.js', DynamicJsView.as_view(template_name='js/translated/search.js'), name='search.js'),
     re_path(r'^stock.js', DynamicJsView.as_view(template_name='js/translated/stock.js'), name='stock.js'),
+    re_path(r'^status_codes.js', DynamicJsView.as_view(template_name='js/translated/status_codes.js'), name='status_codes.js'),
     re_path(r'^plugin.js', DynamicJsView.as_view(template_name='js/translated/plugin.js'), name='plugin.js'),
     re_path(r'^pricing.js', DynamicJsView.as_view(template_name='js/translated/pricing.js'), name='pricing.js'),
     re_path(r'^news.js', DynamicJsView.as_view(template_name='js/translated/news.js'), name='news.js'),
@@ -128,10 +164,10 @@ backendpatterns = [
     re_path(r'^auth/?', auth_request),
 
     re_path(r'^api/', include(apipatterns)),
-    re_path(r'^api-doc/', include_docs_urls(title='InvenTree API')),
+    re_path(r'^api-doc/', SpectacularRedocView.as_view(url_name='schema'), name='api-doc'),
 ]
 
-frontendpatterns = [
+classic_frontendpatterns = [
 
     # Apps
     re_path(r'^build/', include(build_urls)),
@@ -167,16 +203,23 @@ frontendpatterns = [
     re_path(r'^accounts/social/connections/', CustomConnectionsView.as_view(), name='socialaccount_connections'),
     re_path(r"^accounts/password/reset/key/(?P<uidb36>[0-9A-Za-z]+)-(?P<key>.+)/$", CustomPasswordResetFromKeyView.as_view(), name="account_reset_password_from_key"),
 
-    # Temporary fix for django-allauth-2fa # TODO remove
-    # See https://github.com/inventree/InvenTree/security/advisories/GHSA-8j76-mm54-52xq
-    re_path(r'^accounts/two_factor/remove/?$', CustomTwoFactorRemove.as_view(), name='two-factor-remove'),
-
     # Override login page
     re_path("accounts/login/", CustomLoginView.as_view(), name="account_login"),
 
     re_path(r'^accounts/', include('allauth_2fa.urls')),    # MFA support
     re_path(r'^accounts/', include('allauth.urls')),        # included urlpatterns
 ]
+
+
+new_frontendpatterns = platform_urls
+
+# Load patterns for frontend according to settings
+frontendpatterns = []
+if settings.ENABLE_CLASSIC_FRONTEND:
+    frontendpatterns.append(re_path('', include(classic_frontendpatterns)))
+if settings.ENABLE_PLATFORM_FRONTEND:
+    frontendpatterns.append(re_path('', include(new_frontendpatterns)))
+
 
 # Append custom plugin URLs (if plugin support is enabled)
 if settings.PLUGINS_ENABLED:

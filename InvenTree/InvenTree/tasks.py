@@ -3,20 +3,28 @@
 import json
 import logging
 import os
+import random
 import re
+import time
 import warnings
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Callable, List
 
 from django.conf import settings
-from django.core import mail as django_mail
 from django.core.exceptions import AppRegistryNotReady
 from django.core.management import call_command
-from django.db.utils import OperationalError, ProgrammingError
+from django.db import DEFAULT_DB_ALIAS, connections
+from django.db.migrations.executor import MigrationExecutor
+from django.db.utils import (NotSupportedError, OperationalError,
+                             ProgrammingError)
 from django.utils import timezone
 
 import requests
+from maintenance_mode.core import (get_maintenance_mode, maintenance_mode_on,
+                                   set_maintenance_mode)
+
+from InvenTree.config import get_setting
 
 logger = logging.getLogger("inventree")
 
@@ -62,7 +70,96 @@ def raise_warning(msg):
 
     # If testing is running raise a warning that can be asserted
     if settings.TESTING:
-        warnings.warn(msg)
+        warnings.warn(msg, stacklevel=2)
+
+
+def check_daily_holdoff(task_name: str, n_days: int = 1) -> bool:
+    """Check if a periodic task should be run, based on the provided setting name.
+
+    Arguments:
+        task_name: The name of the task being run, e.g. 'dummy_task'
+        setting_name: The name of the global setting, e.g. 'INVENTREE_DUMMY_TASK_INTERVAL'
+
+    Returns:
+        bool: If the task should be run *now*, or wait another day
+
+    This function will determine if the task should be run *today*,
+    based on when it was last run, or if we have a record of it running at all.
+
+    Note that this function creates some *hidden* global settings (designated with the _ prefix),
+    which are used to keep a running track of when the particular task was was last run.
+    """
+
+    from common.models import InvenTreeSetting
+    from InvenTree.ready import isInTestMode
+
+    if n_days <= 0:
+        logger.info(f"Specified interval for task '{task_name}' < 1 - task will not run")
+        return False
+
+    # Sleep a random number of seconds to prevent worker conflict
+    if not isInTestMode():
+        time.sleep(random.randint(1, 5))
+
+    attempt_key = f'_{task_name}_ATTEMPT'
+    success_key = f'_{task_name}_SUCCESS'
+
+    # Check for recent success information
+    last_success = InvenTreeSetting.get_setting(success_key, '', cache=False)
+
+    if last_success:
+        try:
+            last_success = datetime.fromisoformat(last_success)
+        except ValueError:
+            last_success = None
+
+    if last_success:
+        threshold = datetime.now() - timedelta(days=n_days)
+
+        if last_success > threshold:
+            logger.info(f"Last successful run for '{task_name}' was too recent - skipping task")
+            return False
+
+    # Check for any information we have about this task
+    last_attempt = InvenTreeSetting.get_setting(attempt_key, '', cache=False)
+
+    if last_attempt:
+        try:
+            last_attempt = datetime.fromisoformat(last_attempt)
+        except ValueError:
+            last_attempt = None
+
+    if last_attempt:
+        # Do not attempt if the most recent *attempt* was within 12 hours
+        threshold = datetime.now() - timedelta(hours=12)
+
+        if last_attempt > threshold:
+            logger.info(f"Last attempt for '{task_name}' was too recent - skipping task")
+            return False
+
+    # Record this attempt
+    record_task_attempt(task_name)
+
+    # No reason *not* to run this task now
+    return True
+
+
+def record_task_attempt(task_name: str):
+    """Record that a multi-day task has been attempted *now*"""
+
+    from common.models import InvenTreeSetting
+
+    logger.info(f"Logging task attempt for '{task_name}'")
+
+    InvenTreeSetting.set_setting(f'_{task_name}_ATTEMPT', datetime.now().isoformat(), None)
+
+
+def record_task_success(task_name: str):
+    """Record that a multi-day task was successful *now*"""
+
+    from common.models import InvenTreeSetting
+
+    InvenTreeSetting.set_setting(f'_{task_name}_SUCCESS', datetime.now().isoformat(), None)
 
 
 def offload_task(taskname, *args, force_async=False, force_sync=False, **kwargs):
@@ -71,6 +168,7 @@ def offload_task(taskname, *args, force_async=False, force_sync=False, **kwargs)
     If workers are not running or force_sync flag
     is set then the task is ran synchronously.
     """
+
     try:
         import importlib
 
@@ -90,6 +188,8 @@ def offload_task(taskname, *args, force_async=False, force_sync=False, **kwargs)
             task.run()
         except ImportError:
             raise_warning(f"WARNING: '{taskname}' not started - Function not found")
+        except Exception as exc:
+            raise_warning(f"WARNING: '{taskname}' not started due to {type(exc)}")
     else:
 
         if callable(taskname):
@@ -153,7 +253,7 @@ class ScheduledTask:
 
 
 class TaskRegister:
-    """Registery for periodicall tasks."""
+    """Registry for periodicall tasks."""
     task_list: List[ScheduledTask] = []
 
     def register(self, task, schedule, minutes: int = None):
@@ -339,6 +439,14 @@ def check_for_updates():
         logger.info("Could not perform 'check_for_updates' - App registry not ready")
         return
 
+    interval = int(common.models.InvenTreeSetting.get_setting('INVENTREE_UPDATE_CHECK_INTERVAL', 7, cache=False))
+
+    # Check if we should check for updates *today*
+    if not check_daily_holdoff('check_for_updates', interval):
+        return
+
+    logger.info("Checking for InvenTree software updates")
+
     headers = {}
 
     # If running within github actions, use authentication token
@@ -348,7 +456,10 @@ def check_for_updates():
         if token:
             headers['Authorization'] = f"Bearer {token}"
 
-    response = requests.get('https://api.github.com/repos/inventree/inventree/releases/latest', headers=headers)
+    response = requests.get(
+        'https://api.github.com/repos/inventree/inventree/releases/latest',
+        headers=headers
+    )
 
     if response.status_code != 200:
         raise ValueError(f'Unexpected status code from GitHub API: {response.status_code}')  # pragma: no cover
@@ -375,17 +486,20 @@ def check_for_updates():
 
     # Save the version to the database
     common.models.InvenTreeSetting.set_setting(
-        'INVENTREE_LATEST_VERSION',
+        '_INVENTREE_LATEST_VERSION',
         tag,
         None
     )
+
+    # Record that this task was successful
+    record_task_success('check_for_updates')
 
 
 @scheduled_task(ScheduledTask.DAILY)
 def update_exchange_rates():
     """Update currency exchange rates."""
     try:
-        from djmoney.contrib.exchange.models import ExchangeBackend, Rate
+        from djmoney.contrib.exchange.models import Rate
 
         from common.settings import currency_code_default, currency_codes
         from InvenTree.exchange import InvenTreeExchange
@@ -397,53 +511,112 @@ def update_exchange_rates():
         # Other error?
         return
 
-    # Test to see if the database is ready yet
-    try:
-        backend = ExchangeBackend.objects.get(name='InvenTreeExchange')
-    except ExchangeBackend.DoesNotExist:
-        pass
-    except Exception:  # pragma: no cover
-        # Some other error
-        logger.warning("update_exchange_rates: Database not ready")
-        return
-
     backend = InvenTreeExchange()
-    logger.info(f"Updating exchange rates from {backend.url}")
-
     base = currency_code_default()
-
-    logger.info(f"Using base currency '{base}'")
+    logger.info(f"Updating exchange rates using base currency '{base}'")
 
     try:
         backend.update_rates(base_currency=base)
 
         # Remove any exchange rates which are not in the provided currencies
         Rate.objects.filter(backend="InvenTreeExchange").exclude(currency__in=currency_codes()).delete()
+    except OperationalError:
+        logger.warning("Could not update exchange rates - database not ready")
     except Exception as e:  # pragma: no cover
-        logger.error(f"Error updating exchange rates: {e}")
+        logger.error(f"Error updating exchange rates: {e} ({type(e)})")
 
 
 @scheduled_task(ScheduledTask.DAILY)
 def run_backup():
     """Run the backup command."""
+
     from common.models import InvenTreeSetting
 
-    if InvenTreeSetting.get_setting('INVENTREE_BACKUP_ENABLE'):
-        call_command("dbbackup", noinput=True, clean=True, compress=True, interactive=False)
-        call_command("mediabackup", noinput=True, clean=True, compress=True, interactive=False)
+    if not InvenTreeSetting.get_setting('INVENTREE_BACKUP_ENABLE', False, cache=False):
+        # Backups are not enabled - exit early
+        return
+
+    interval = int(InvenTreeSetting.get_setting('INVENTREE_BACKUP_DAYS', 1, cache=False))
+
+    # Check if should run this task *today*
+    if not check_daily_holdoff('run_backup', interval):
+        return
+
+    logger.info("Performing automated database backup task")
+
+    call_command("dbbackup", noinput=True, clean=True, compress=True, interactive=False)
+    call_command("mediabackup", noinput=True, clean=True, compress=True, interactive=False)
+
+    # Record that this task was successful
+    record_task_success('run_backup')
 
 
-def send_email(subject, body, recipients, from_email=None, html_message=None):
-    """Send an email with the specified subject and body, to the specified recipients list."""
-    if type(recipients) == str:
-        recipients = [recipients]
+@scheduled_task(ScheduledTask.DAILY)
+def check_for_migrations(worker: bool = True):
+    """Checks if migrations are needed.
 
-    offload_task(
-        django_mail.send_mail,
-        subject,
-        body,
-        from_email,
-        recipients,
-        fail_silently=False,
-        html_message=html_message
-    )
+    If the setting auto_update is enabled we will start updating.
+    """
+    # Test if auto-updates are enabled
+    if not get_setting('INVENTREE_AUTO_UPDATE', 'auto_update'):
+        return
+
+    from plugin import registry
+
+    plan = get_migration_plan()
+
+    # Check if there are any open migrations
+    if not plan:
+        logger.info('There are no open migrations')
+        return
+
+    logger.info('There are open migrations')
+
+    # Log open migrations
+    for migration in plan:
+        logger.info(migration[0])
+
+    # Set the application to maintenance mode - no access from now on.
+    logger.info('Going into maintenance')
+    set_maintenance_mode(True)
+    logger.info('Mainentance mode is on now')
+
+    # Check if we are worker - go kill all other workers then.
+    # Only the frontend workers run updates.
+    if worker:
+        logger.info('Current process is a worker - shutting down cluster')
+
+    # Ok now we are ready to go ahead!
+    # To be sure we are in maintenance this is wrapped
+    with maintenance_mode_on():
+        logger.info('Starting migrations')
+        print('Starting migrations')
+
+        try:
+            call_command('migrate', interactive=False)
+        except NotSupportedError as e:  # pragma: no cover
+            if settings.DATABASES['default']['ENGINE'] != 'django.db.backends.sqlite3':
+                raise e
+            logger.error(f'Error during migrations: {e}')
+
+        print('Migrations done')
+        logger.info('Ran migrations')
+
+    # Make sure we are out of maintenance again
+    logger.info('Checking InvenTree left maintenance mode')
+    if get_maintenance_mode():
+
+        logger.warning('Mainentance was still on - releasing now')
+        set_maintenance_mode(False)
+        logger.info('Released out of maintenance')
+
+    # We should be current now - triggering full reload to make sure all models
+    # are loaded fully in their new state.
+    registry.reload_plugins(full_reload=True, force_reload=True)
+
+
+def get_migration_plan():
+    """Returns a list of migrations which are needed to be run."""
+    executor = MigrationExecutor(connections[DEFAULT_DB_ALIAS])
+    plan = executor.migration_plan(executor.loader.graph.leaf_nodes())
+    return plan

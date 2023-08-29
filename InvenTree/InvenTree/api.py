@@ -5,16 +5,20 @@ from django.db import transaction
 from django.http import JsonResponse
 from django.utils.translation import gettext_lazy as _
 
-from django_filters.rest_framework import DjangoFilterBackend
 from django_q.models import OrmQ
-from rest_framework import filters, permissions
+from rest_framework import permissions
 from rest_framework.response import Response
 from rest_framework.serializers import ValidationError
+from rest_framework.views import APIView
 
+import users.models
+from InvenTree.filters import SEARCH_ORDER_FILTER
 from InvenTree.mixins import ListCreateAPI
 from InvenTree.permissions import RolePermission
 from part.templatetags.inventree_extras import plugins_info
+from plugin.serializers import MetadataSerializer
 
+from .mixins import RetrieveUpdateAPI
 from .status import is_worker_running
 from .version import (inventreeApiVersion, inventreeInstanceName,
                       inventreeVersion)
@@ -55,14 +59,39 @@ class NotFoundView(AjaxView):
 
     permission_classes = [permissions.AllowAny]
 
-    def get(self, request, *args, **kwargs):
-        """Proces an `not found` event on the API."""
-        data = {
-            'details': _('API endpoint not found'),
-            'url': request.build_absolute_uri(),
-        }
+    def not_found(self, request):
+        """Return a 404 error"""
+        return JsonResponse(
+            {
+                'detail': _('API endpoint not found'),
+                'url': request.build_absolute_uri(),
+            },
+            status=404
+        )
 
-        return JsonResponse(data, status=404)
+    def options(self, request, *args, **kwargs):
+        """Return 404"""
+        return self.not_found(request)
+
+    def get(self, request, *args, **kwargs):
+        """Return 404"""
+        return self.not_found(request)
+
+    def post(self, request, *args, **kwargs):
+        """Return 404"""
+        return self.not_found(request)
+
+    def patch(self, request, *args, **kwargs):
+        """Return 404"""
+        return self.not_found(request)
+
+    def put(self, request, *args, **kwargs):
+        """Return 404"""
+        return self.not_found(request)
+
+    def delete(self, request, *args, **kwargs):
+        """Return 404"""
+        return self.not_found(request)
 
 
 class BulkDeleteMixin:
@@ -197,14 +226,138 @@ class AttachmentMixin:
         RolePermission,
     ]
 
-    filter_backends = [
-        DjangoFilterBackend,
-        filters.OrderingFilter,
-        filters.SearchFilter,
-    ]
+    filter_backends = SEARCH_ORDER_FILTER
 
     def perform_create(self, serializer):
         """Save the user information when a file is uploaded."""
         attachment = serializer.save()
         attachment.user = self.request.user
         attachment.save()
+
+
+class APISearchView(APIView):
+    """A general-purpose 'search' API endpoint
+
+    Returns hits against a number of different models simultaneously,
+    to consolidate multiple API requests into a single query.
+
+    Is much more efficient and simplifies code!
+    """
+
+    permission_classes = [
+        permissions.IsAuthenticated,
+    ]
+
+    def get_result_types(self):
+        """Construct a list of search types we can return"""
+
+        import build.api
+        import company.api
+        import order.api
+        import part.api
+        import stock.api
+
+        return {
+            'build': build.api.BuildList,
+            'company': company.api.CompanyList,
+            'manufacturerpart': company.api.ManufacturerPartList,
+            'supplierpart': company.api.SupplierPartList,
+            'part': part.api.PartList,
+            'partcategory': part.api.CategoryList,
+            'purchaseorder': order.api.PurchaseOrderList,
+            'returnorder': order.api.ReturnOrderList,
+            'salesorder': order.api.SalesOrderList,
+            'stockitem': stock.api.StockList,
+            'stocklocation': stock.api.StockLocationList,
+        }
+
+    def post(self, request, *args, **kwargs):
+        """Perform search query against available models"""
+
+        data = request.data
+
+        results = {}
+
+        # These parameters are passed through to the individual queries, with optional default values
+        pass_through_params = {
+            'search': '',
+            'search_regex': False,
+            'search_whole': False,
+            'limit': 1,
+            'offset': 0,
+        }
+
+        if 'search' not in data:
+            raise ValidationError({
+                'search': 'Search term must be provided',
+            })
+
+        for key, cls in self.get_result_types().items():
+            # Only return results which are specifically requested
+            if key in data:
+
+                params = data[key]
+
+                for k, v in pass_through_params.items():
+                    params[k] = request.data.get(k, v)
+
+                # Enforce json encoding
+                params['format'] = 'json'
+
+                # Ignore if the params are wrong
+                if type(params) is not dict:
+                    continue
+
+                view = cls()
+
+                # Override regular query params with specific ones for this search request
+                request._request.GET = params
+                view.request = request
+                view.format_kwarg = 'format'
+
+                # Check permissions and update results dict with particular query
+                model = view.serializer_class.Meta.model
+                app_label = model._meta.app_label
+                model_name = model._meta.model_name
+                table = f'{app_label}_{model_name}'
+
+                try:
+                    if users.models.RuleSet.check_table_permission(request.user, table, 'view'):
+                        results[key] = view.list(request, *args, **kwargs).data
+                    else:
+                        results[key] = {
+                            'error': _('User does not have permission to view this model')
+                        }
+                except Exception as exc:
+                    results[key] = {
+                        'error': str(exc)
+                    }
+
+        return Response(results)
+
+
+class MetadataView(RetrieveUpdateAPI):
+    """Generic API endpoint for reading and editing metadata for a model"""
+
+    MODEL_REF = 'model'
+
+    def get_model_type(self):
+        """Return the model type associated with this API instance"""
+        model = self.kwargs.get(self.MODEL_REF, None)
+
+        if model is None:
+            raise ValidationError(f"MetadataView called without '{self.MODEL_REF}' parameter")
+
+        return model
+
+    def get_permission_model(self):
+        """Return the 'permission' model associated with this view"""
+        return self.get_model_type()
+
+    def get_queryset(self):
+        """Return the queryset for this endpoint"""
+        return self.get_model_type().objects.all()
+
+    def get_serializer(self, *args, **kwargs):
+        """Return MetadataSerializer instance"""
+        return MetadataSerializer(self.get_model_type(), *args, **kwargs)

@@ -17,6 +17,11 @@ capture_output = True
 worker_tmp_dir = '/dev/shm'  # Write temp file to RAM (faster)
 threads = 4
 
+
+# Worker timeout (default = 90 seconds)
+timeout = os.environ.get('INVENTREE_GUNICORN_TIMEOUT', 90)
+
+# Number of worker processes
 workers = os.environ.get('INVENTREE_GUNICORN_WORKERS', None)
 
 if workers is not None:
@@ -32,3 +37,6 @@ logger.info(f"Starting gunicorn server with {workers} workers")
 
 max_requests = 1000
 max_requests_jitter = 50
+
+# preload app so that the ready functions are only executed once
+preload_app = True

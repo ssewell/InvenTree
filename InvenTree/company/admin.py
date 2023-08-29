@@ -2,16 +2,16 @@
 
 from django.contrib import admin
 
-import import_export.widgets as widgets
+from import_export import widgets
 from import_export.admin import ImportExportModelAdmin
 from import_export.fields import Field
 
 from InvenTree.admin import InvenTreeResource
 from part.models import Part
 
-from .models import (Company, ManufacturerPart, ManufacturerPartAttachment,
-                     ManufacturerPartParameter, SupplierPart,
-                     SupplierPriceBreak)
+from .models import (Address, Company, Contact, ManufacturerPart,
+                     ManufacturerPartAttachment, ManufacturerPartParameter,
+                     SupplierPart, SupplierPriceBreak)
 
 
 class CompanyResource(InvenTreeResource):
@@ -41,6 +41,13 @@ class CompanyAdmin(ImportExportModelAdmin):
 class SupplierPartResource(InvenTreeResource):
     """Class for managing SupplierPart data import/export."""
 
+    class Meta:
+        """Metaclass defines extra admin options"""
+        model = SupplierPart
+        skip_unchanged = True
+        report_skipped = True
+        clean_model_instances = True
+
     part = Field(attribute='part', widget=widgets.ForeignKeyWidget(Part))
 
     part_name = Field(attribute='part__full_name', readonly=True)
@@ -48,13 +55,6 @@ class SupplierPartResource(InvenTreeResource):
     supplier = Field(attribute='supplier', widget=widgets.ForeignKeyWidget(Company))
 
     supplier_name = Field(attribute='supplier__name', readonly=True)
-
-    class Meta:
-        """Metaclass defines extra admin options"""
-        model = SupplierPart
-        skip_unchanged = True
-        report_skipped = True
-        clean_model_instances = True
 
 
 class SupplierPriceBreakInline(admin.TabularInline):
@@ -87,6 +87,13 @@ class SupplierPartAdmin(ImportExportModelAdmin):
 class ManufacturerPartResource(InvenTreeResource):
     """Class for managing ManufacturerPart data import/export."""
 
+    class Meta:
+        """Metaclass defines extra admin options"""
+        model = ManufacturerPart
+        skip_unchanged = True
+        report_skipped = True
+        clean_model_instances = True
+
     part = Field(attribute='part', widget=widgets.ForeignKeyWidget(Part))
 
     part_name = Field(attribute='part__full_name', readonly=True)
@@ -94,13 +101,6 @@ class ManufacturerPartResource(InvenTreeResource):
     manufacturer = Field(attribute='manufacturer', widget=widgets.ForeignKeyWidget(Company))
 
     manufacturer_name = Field(attribute='manufacturer__name', readonly=True)
-
-    class Meta:
-        """Metaclass defines extra admin options"""
-        model = ManufacturerPart
-        skip_unchanged = True
-        report_skipped = True
-        clean_model_instances = True
 
 
 class ManufacturerPartAdmin(ImportExportModelAdmin):
@@ -157,6 +157,13 @@ class ManufacturerPartParameterAdmin(ImportExportModelAdmin):
 class SupplierPriceBreakResource(InvenTreeResource):
     """Class for managing SupplierPriceBreak data import/export."""
 
+    class Meta:
+        """Metaclass defines extra admin options"""
+        model = SupplierPriceBreak
+        skip_unchanged = True
+        report_skipped = False
+        clean_model_instances = True
+
     part = Field(attribute='part', widget=widgets.ForeignKeyWidget(SupplierPart))
 
     supplier_id = Field(attribute='part__supplier__pk', readonly=True)
@@ -169,13 +176,6 @@ class SupplierPriceBreakResource(InvenTreeResource):
 
     MPN = Field(attribute='part__MPN', readonly=True)
 
-    class Meta:
-        """Metaclass defines extra admin options"""
-        model = SupplierPriceBreak
-        skip_unchanged = True
-        report_skipped = False
-        clean_model_instances = True
-
 
 class SupplierPriceBreakAdmin(ImportExportModelAdmin):
     """Admin class for the SupplierPriceBreak model"""
@@ -187,6 +187,60 @@ class SupplierPriceBreakAdmin(ImportExportModelAdmin):
     autocomplete_fields = ('part',)
 
 
+class AddressResource(InvenTreeResource):
+    """Class for managing Address data import/export"""
+
+    class Meta:
+        """Metaclass defining extra options"""
+        model = Address
+        skip_unchanged = True
+        report_skipped = False
+        clean_model_instances = True
+
+    company = Field(attribute='company', widget=widgets.ForeignKeyWidget(Company))
+
+
+class AddressAdmin(ImportExportModelAdmin):
+    """Admin class for the Address model"""
+
+    resource_class = AddressResource
+
+    list_display = ('company', 'line1', 'postal_code', 'country')
+
+    search_fields = [
+        'company',
+        'country',
+        'postal_code',
+    ]
+
+
+class ContactResource(InvenTreeResource):
+    """Class for managing Contact data import/export"""
+
+    class Meta:
+        """Metaclass defining extra options"""
+        model = Contact
+        skip_unchanged = True
+        report_skipped = False
+        clean_model_instances = True
+
+    company = Field(attribute='company', widget=widgets.ForeignKeyWidget(Company))
+
+
+class ContactAdmin(ImportExportModelAdmin):
+    """Admin class for the Contact model"""
+
+    resource_class = ContactResource
+
+    list_display = ('company', 'name', 'role', 'email', 'phone')
+
+    search_fields = [
+        'company',
+        'name',
+        'email',
+    ]
+
+
 admin.site.register(Company, CompanyAdmin)
 admin.site.register(SupplierPart, SupplierPartAdmin)
 admin.site.register(SupplierPriceBreak, SupplierPriceBreakAdmin)
@@ -194,3 +248,6 @@ admin.site.register(SupplierPriceBreak, SupplierPriceBreakAdmin)
 admin.site.register(ManufacturerPart, ManufacturerPartAdmin)
 admin.site.register(ManufacturerPartAttachment, ManufacturerPartAttachmentAdmin)
 admin.site.register(ManufacturerPartParameter, ManufacturerPartParameterAdmin)
+
+admin.site.register(Address, AddressAdmin)
+admin.site.register(Contact, ContactAdmin)

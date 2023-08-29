@@ -11,10 +11,12 @@ import json
 import logging
 import math
 import os
+import re
 import uuid
 from datetime import datetime, timedelta
 from enum import Enum
 from secrets import compare_digest
+from typing import Any, Callable, Dict, List, Tuple, TypedDict, Union
 
 from django.apps import apps
 from django.conf import settings
@@ -28,7 +30,9 @@ from django.core.exceptions import AppRegistryNotReady, ValidationError
 from django.core.validators import (MaxValueValidator, MinValueValidator,
                                     URLValidator)
 from django.db import models, transaction
+from django.db.models.signals import post_delete, post_save
 from django.db.utils import IntegrityError, OperationalError
+from django.dispatch.dispatcher import receiver
 from django.urls import reverse
 from django.utils.timezone import now
 from django.utils.translation import gettext_lazy as _
@@ -41,11 +45,33 @@ from rest_framework.exceptions import PermissionDenied
 import build.validators
 import InvenTree.fields
 import InvenTree.helpers
+import InvenTree.models
 import InvenTree.ready
+import InvenTree.tasks
 import InvenTree.validators
 import order.validators
+from plugin import registry
 
 logger = logging.getLogger('inventree')
+
+
+class MetaMixin(models.Model):
+    """A base class for InvenTree models to include shared meta fields.
+
+    Attributes:
+    - updated: The last time this object was updated
+    """
+
+    class Meta:
+        """Meta options for MetaMixin."""
+        abstract = True
+
+    updated = models.DateTimeField(
+        verbose_name=_('Updated'),
+        help_text=_('Timestamp of last update'),
+        auto_now=True,
+        null=True,
+    )
 
 
 class EmptyURLValidator(URLValidator):
@@ -62,10 +88,76 @@ class EmptyURLValidator(URLValidator):
             super().__call__(value)
 
 
-class BaseInvenTreeSetting(models.Model):
-    """An base InvenTreeSetting object is a key:value pair used for storing single values (e.g. one-off settings values)."""
+class ProjectCode(InvenTree.models.MetadataMixin, models.Model):
+    """A ProjectCode is a unique identifier for a project."""
 
-    SETTINGS = {}
+    @staticmethod
+    def get_api_url():
+        """Return the API URL for this model."""
+        return reverse('api-project-code-list')
+
+    def __str__(self):
+        """String representation of a ProjectCode."""
+        return self.code
+
+    code = models.CharField(
+        max_length=50,
+        unique=True,
+        verbose_name=_('Project Code'),
+        help_text=_('Unique project code'),
+    )
+
+    description = models.CharField(
+        max_length=200,
+        blank=True,
+        verbose_name=_('Description'),
+        help_text=_('Project description'),
+    )
+
+
+class SettingsKeyType(TypedDict, total=False):
+    """Type definitions for a SettingsKeyType
+
+    Attributes:
+        name: Translatable string name of the setting (required)
+        description: Translatable string description of the setting (required)
+        units: Units of the particular setting (optional)
+        validator: Validation function/list of functions for the setting (optional, default: None, e.g: bool, int, str, MinValueValidator, ...)
+        default: Default value or function that returns default value (optional)
+        choices: (Function that returns) Tuple[str: key, str: display value] (optional)
+        hidden: Hide this setting from settings page (optional)
+        before_save: Function that gets called after save with *args, **kwargs (optional)
+        after_save: Function that gets called after save with *args, **kwargs (optional)
+        protected: Protected values are not returned to the client, instead "***" is returned (optional, default: False)
+        required: Is this setting required to work, can be used in combination with .check_all_settings(...) (optional, default: False)
+        model: Auto create a dropdown menu to select an associated model instance (e.g. 'company.company', 'auth.user' and 'auth.group' are possible too, optional)
+    """
+
+    name: str
+    description: str
+    units: str
+    validator: Union[Callable, List[Callable], Tuple[Callable]]
+    default: Union[Callable, Any]
+    choices: Union[Tuple[str, str], Callable[[], Tuple[str, str]]]
+    hidden: bool
+    before_save: Callable[..., None]
+    after_save: Callable[..., None]
+    protected: bool
+    required: bool
+    model: str
+
+
+class BaseInvenTreeSetting(models.Model):
+    """An base InvenTreeSetting object is a key:value pair used for storing single values (e.g. one-off settings values).
+
+    Attributes:
+        SETTINGS: definition of all available settings
+        extra_unique_fields: List of extra fields used to be unique, e.g. for PluginConfig -> plugin
+    """
+
+    SETTINGS: Dict[str, SettingsKeyType] = {}
+
+    extra_unique_fields: List[str] = []
 
     class Meta:
         """Meta options for BaseInvenTreeSetting -> abstract stops creation of database entry."""
@@ -79,31 +171,49 @@ class BaseInvenTreeSetting(models.Model):
         do_cache = kwargs.pop('cache', True)
 
         self.clean(**kwargs)
-        self.validate_unique(**kwargs)
+        self.validate_unique()
 
-        # Update this setting in the cache
-        if do_cache:
-            self.save_to_cache()
+        # Execute before_save action
+        self._call_settings_function('before_save', args, kwargs)
 
         super().save()
 
-        # Get after_save action
-        setting = self.get_setting_definition(self.key, *args, **kwargs)
-        after_save = setting.get('after_save', None)
+        # Update this setting in the cache after it was saved so a pk exists
+        if do_cache:
+            self.save_to_cache()
+
+        # Execute after_save action
+        self._call_settings_function('after_save', args, kwargs)
+
+    def _call_settings_function(self, reference: str, args, kwargs):
+        """Call a function associated with a particular setting.
+
+        Args:
+            reference (str): The name of the function to call
+            args: Positional arguments to pass to the function
+            kwargs: Keyword arguments to pass to the function
+        """
+        # Get action
+        setting = self.get_setting_definition(self.key, *args, **{**self.get_filters_for_instance(), **kwargs})
+        settings_fnc = setting.get(reference, None)
 
         # Execute if callable
-        if callable(after_save):
-            after_save(self)
+        if callable(settings_fnc):
+            settings_fnc(self)
 
     @property
     def cache_key(self):
         """Generate a unique cache key for this settings object"""
-        return self.__class__.create_cache_key(self.key, **self.get_kwargs())
+        return self.__class__.create_cache_key(self.key, **self.get_filters_for_instance())
 
     def save_to_cache(self):
         """Save this setting object to cache"""
 
         ckey = self.cache_key
+
+        # skip saving to cache if no pk is set
+        if self.pk is None:
+            return
 
         logger.debug(f"Saving setting '{ckey}' to cache")
 
@@ -135,65 +245,107 @@ class BaseInvenTreeSetting(models.Model):
         return key.replace(" ", "")
 
     @classmethod
-    def allValues(cls, user=None, exclude_hidden=False):
+    def get_filters(cls, **kwargs):
+        """Enable to filter by other kwargs defined in cls.extra_unique_fields"""
+        return {key: value for key, value in kwargs.items() if key in cls.extra_unique_fields}
+
+    def get_filters_for_instance(self):
+        """Enable to filter by other fields defined in self.extra_unique_fields"""
+        return {key: getattr(self, key, None) for key in self.extra_unique_fields if hasattr(self, key)}
+
+    @classmethod
+    def all_settings(cls, *, exclude_hidden=False, settings_definition: Union[Dict[str, SettingsKeyType], None] = None, **kwargs):
+        """Return a list of "all" defined settings.
+
+        This performs a single database lookup,
+        and then any settings which are not *in* the database
+        are assigned their default values
+        """
+        filters = cls.get_filters(**kwargs)
+
+        results = cls.objects.all()
+
+        if exclude_hidden:
+            # Keys which start with an underscore are used for internal functionality
+            results = results.exclude(key__startswith='_')
+
+        # Optionally filter by other keys
+        results = results.filter(**filters)
+
+        settings: Dict[str, BaseInvenTreeSetting] = {}
+
+        # Query the database
+        for setting in results:
+            if setting.key:
+                settings[setting.key.upper()] = setting
+
+        # Specify any "default" values which are not in the database
+        settings_definition = settings_definition or cls.SETTINGS
+        for key, setting in settings_definition.items():
+            if key.upper() not in settings:
+                settings[key.upper()] = cls(
+                    key=key.upper(),
+                    value=cls.get_setting_default(key, **filters),
+                    **filters
+                )
+
+            # remove any hidden settings
+            if exclude_hidden and setting.get("hidden", False):
+                del settings[key.upper()]
+
+        # format settings values and remove protected
+        for key, setting in settings.items():
+            validator = cls.get_setting_validator(key, **filters)
+
+            if cls.is_protected(key, **filters) and setting.value != "":
+                setting.value = '***'
+            elif cls.validator_is_bool(validator):
+                setting.value = InvenTree.helpers.str2bool(setting.value)
+            elif cls.validator_is_int(validator):
+                try:
+                    setting.value = int(setting.value)
+                except ValueError:
+                    setting.value = cls.get_setting_default(key, **filters)
+
+        return settings
+
+    @classmethod
+    def allValues(cls, *, exclude_hidden=False, settings_definition: Union[Dict[str, SettingsKeyType], None] = None, **kwargs):
         """Return a dict of "all" defined global settings.
 
         This performs a single database lookup,
         and then any settings which are not *in* the database
         are assigned their default values
         """
-        results = cls.objects.all()
+        all_settings = cls.all_settings(exclude_hidden=exclude_hidden, settings_definition=settings_definition, **kwargs)
 
-        # Optionally filter by user
-        if user is not None:
-            results = results.filter(user=user)
+        settings: Dict[str, Any] = {}
 
-        # Query the database
-        settings = {}
-
-        for setting in results:
-            if setting.key:
-                settings[setting.key.upper()] = setting.value
-
-        # Specify any "default" values which are not in the database
-        for key in cls.SETTINGS.keys():
-
-            if key.upper() not in settings:
-                settings[key.upper()] = cls.get_setting_default(key)
-
-            if exclude_hidden:
-                hidden = cls.SETTINGS[key].get('hidden', False)
-
-                if hidden:
-                    # Remove hidden items
-                    del settings[key.upper()]
-
-        for key, value in settings.items():
-            validator = cls.get_setting_validator(key)
-
-            if cls.is_protected(key):
-                value = '***'
-            elif cls.validator_is_bool(validator):
-                value = InvenTree.helpers.str2bool(value)
-            elif cls.validator_is_int(validator):
-                try:
-                    value = int(value)
-                except ValueError:
-                    value = cls.get_setting_default(key)
-
-            settings[key] = value
+        for key, setting in all_settings.items():
+            settings[key] = setting.value
 
         return settings
 
-    def get_kwargs(self):
-        """Construct kwargs for doing class-based settings lookup, depending on *which* class we are.
+    @classmethod
+    def check_all_settings(cls, *, exclude_hidden=False, settings_definition: Union[Dict[str, SettingsKeyType], None] = None, **kwargs):
+        """Check if all required settings are set by definition.
 
-        This is necessary to abtract the settings object
-        from the implementing class (e.g plugins)
-
-        Subclasses should override this function to ensure the kwargs are correctly set.
+        Returns:
+            is_valid: Are all required settings defined
+            missing_settings: List of all settings that are missing (empty if is_valid is 'True')
         """
-        return {}
+        all_settings = cls.all_settings(exclude_hidden=exclude_hidden, settings_definition=settings_definition, **kwargs)
+
+        missing_settings: List[str] = []
+
+        for setting in all_settings.values():
+            if setting.required:
+                value = setting.value or cls.get_setting_default(setting.key, **kwargs)
+
+                if value == "":
+                    missing_settings.append(setting.key.upper())
+
+        return len(missing_settings) == 0, missing_settings
 
     @classmethod
     def get_setting_definition(cls, key, **kwargs):
@@ -293,31 +445,10 @@ class BaseInvenTreeSetting(models.Model):
 
         filters = {
             'key__iexact': key,
+
+            # Optionally filter by other keys
+            **cls.get_filters(**kwargs),
         }
-
-        # Filter by user
-        user = kwargs.get('user', None)
-
-        if user is not None:
-            filters['user'] = user
-
-        # Filter by plugin
-        plugin = kwargs.get('plugin', None)
-
-        if plugin is not None:
-            from plugin import InvenTreePlugin
-
-            if issubclass(plugin.__class__, InvenTreePlugin):
-                plugin = plugin.plugin_config()
-
-            filters['plugin'] = plugin
-            kwargs['plugin'] = plugin
-
-        # Filter by method
-        method = kwargs.get('method', None)
-
-        if method is not None:
-            filters['method'] = method
 
         # Perform cache lookup by default
         do_cache = kwargs.pop('cache', True)
@@ -348,17 +479,20 @@ class BaseInvenTreeSetting(models.Model):
         if not setting:
 
             # Unless otherwise specified, attempt to create the setting
-            create = kwargs.get('create', True)
+            create = kwargs.pop('create', True)
 
             # Prevent creation of new settings objects when importing data
-            if InvenTree.ready.isImportingData() or not InvenTree.ready.canAppAccessDatabase(allow_test=True):
+            if InvenTree.ready.isImportingData() or not InvenTree.ready.canAppAccessDatabase(allow_test=True, allow_shell=True):
                 create = False
 
             if create:
                 # Attempt to create a new settings object
+
+                default_value = cls.get_setting_default(key, **kwargs)
+
                 setting = cls(
                     key=key,
-                    value=cls.get_setting_default(key, **kwargs),
+                    value=default_value,
                     **kwargs
                 )
 
@@ -368,6 +502,9 @@ class BaseInvenTreeSetting(models.Model):
                         setting.save(**kwargs)
                 except (IntegrityError, OperationalError):
                     # It might be the case that the database isn't created yet
+                    pass
+                except ValidationError:
+                    # The setting failed validation - might be due to duplicate keys
                     pass
 
         if setting and do_cache:
@@ -382,7 +519,7 @@ class BaseInvenTreeSetting(models.Model):
 
         If it does not exist, return the backup value (default = None)
         """
-        # If no backup value is specified, atttempt to retrieve a "default" value
+        # If no backup value is specified, attempt to retrieve a "default" value
         if backup_value is None:
             backup_value = cls.get_setting_default(key, **kwargs)
 
@@ -422,21 +559,10 @@ class BaseInvenTreeSetting(models.Model):
 
         filters = {
             'key__iexact': key,
+
+            # Optionally filter by other keys
+            **cls.get_filters(**kwargs),
         }
-
-        user = kwargs.get('user', None)
-        plugin = kwargs.get('plugin', None)
-
-        if user is not None:
-            filters['user'] = user
-
-        if plugin is not None:
-            from plugin import InvenTreePlugin
-
-            if issubclass(plugin.__class__, InvenTreePlugin):
-                filters['plugin'] = plugin.plugin_config()
-            else:
-                filters['plugin'] = plugin
 
         try:
             setting = cls.objects.get(**filters)
@@ -456,27 +582,27 @@ class BaseInvenTreeSetting(models.Model):
 
     key = models.CharField(max_length=50, blank=False, unique=False, help_text=_('Settings key (must be unique - case insensitive)'))
 
-    value = models.CharField(max_length=200, blank=True, unique=False, help_text=_('Settings value'))
+    value = models.CharField(max_length=2000, blank=True, unique=False, help_text=_('Settings value'))
 
     @property
     def name(self):
         """Return name for setting."""
-        return self.__class__.get_setting_name(self.key, **self.get_kwargs())
+        return self.__class__.get_setting_name(self.key, **self.get_filters_for_instance())
 
     @property
     def default_value(self):
         """Return default_value for setting."""
-        return self.__class__.get_setting_default(self.key, **self.get_kwargs())
+        return self.__class__.get_setting_default(self.key, **self.get_filters_for_instance())
 
     @property
     def description(self):
         """Return description for setting."""
-        return self.__class__.get_setting_description(self.key, **self.get_kwargs())
+        return self.__class__.get_setting_description(self.key, **self.get_filters_for_instance())
 
     @property
     def units(self):
         """Return units for setting."""
-        return self.__class__.get_setting_units(self.key, **self.get_kwargs())
+        return self.__class__.get_setting_units(self.key, **self.get_filters_for_instance())
 
     def clean(self, **kwargs):
         """If a validator (or multiple validators) are defined for a particular setting key, run them against the 'value' field."""
@@ -544,7 +670,7 @@ class BaseInvenTreeSetting(models.Model):
 
             validator(value)
 
-    def validate_unique(self, exclude=None, **kwargs):
+    def validate_unique(self, exclude=None):
         """Ensure that the key:value pair is unique. In addition to the base validators, this ensures that the 'key' is unique, using a case-insensitive comparison.
 
         Note that sub-classes (UserSetting, PluginSetting) use other filters
@@ -554,16 +680,10 @@ class BaseInvenTreeSetting(models.Model):
 
         filters = {
             'key__iexact': self.key,
+
+            # Optionally filter by other keys
+            **self.get_filters_for_instance(),
         }
-
-        user = getattr(self, 'user', None)
-        plugin = getattr(self, 'plugin', None)
-
-        if user is not None:
-            filters['user'] = user
-
-        if plugin is not None:
-            filters['plugin'] = plugin
 
         try:
             # Check if a duplicate setting already exists
@@ -577,7 +697,7 @@ class BaseInvenTreeSetting(models.Model):
 
     def choices(self):
         """Return the available choices for this setting (or None if no choices are defined)."""
-        return self.__class__.get_setting_choices(self.key, **self.get_kwargs())
+        return self.__class__.get_setting_choices(self.key, **self.get_filters_for_instance())
 
     def valid_options(self):
         """Return a list of valid options for this setting."""
@@ -590,7 +710,7 @@ class BaseInvenTreeSetting(models.Model):
 
     def is_choice(self):
         """Check if this setting is a "choice" field."""
-        return self.__class__.get_setting_choices(self.key, **self.get_kwargs()) is not None
+        return self.__class__.get_setting_choices(self.key, **self.get_filters_for_instance()) is not None
 
     def as_choice(self):
         """Render this setting as the "display" value of a choice field.
@@ -600,7 +720,7 @@ class BaseInvenTreeSetting(models.Model):
         and the value is 'A4',
         then display 'A4 paper'
         """
-        choices = self.get_setting_choices(self.key, **self.get_kwargs())
+        choices = self.get_setting_choices(self.key, **self.get_filters_for_instance())
 
         if not choices:
             return self.value
@@ -617,7 +737,7 @@ class BaseInvenTreeSetting(models.Model):
 
     def model_name(self):
         """Return the model name associated with this setting."""
-        setting = self.get_setting_definition(self.key, **self.get_kwargs())
+        setting = self.get_setting_definition(self.key, **self.get_filters_for_instance())
 
         return setting.get('model', None)
 
@@ -666,11 +786,22 @@ class BaseInvenTreeSetting(models.Model):
             except Exception:
                 pass
 
+            # Some other model types are hard-coded
+            hardcoded_models = {
+                'auth.user': 'api-user-list',
+                'auth.group': 'api-group-list',
+            }
+
+            model_table = f'{model_class._meta.app_label}.{model_class._meta.model_name}'
+
+            if url := hardcoded_models[model_table]:
+                return reverse(url)
+
         return None
 
     def is_bool(self):
         """Check if this setting is required to be a boolean value."""
-        validator = self.__class__.get_setting_validator(self.key, **self.get_kwargs())
+        validator = self.__class__.get_setting_validator(self.key, **self.get_filters_for_instance())
 
         return self.__class__.validator_is_bool(validator)
 
@@ -710,7 +841,7 @@ class BaseInvenTreeSetting(models.Model):
 
     def is_int(self,):
         """Check if the setting is required to be an integer value."""
-        validator = self.__class__.get_setting_validator(self.key, **self.get_kwargs())
+        validator = self.__class__.get_setting_validator(self.key, **self.get_filters_for_instance())
 
         return self.__class__.validator_is_int(validator)
 
@@ -742,14 +873,26 @@ class BaseInvenTreeSetting(models.Model):
     @classmethod
     def is_protected(cls, key, **kwargs):
         """Check if the setting value is protected."""
-        setting = cls.get_setting_definition(key, **kwargs)
+        setting = cls.get_setting_definition(key, **cls.get_filters(**kwargs))
 
         return setting.get('protected', False)
 
     @property
     def protected(self):
         """Returns if setting is protected from rendering."""
-        return self.__class__.is_protected(self.key, **self.get_kwargs())
+        return self.__class__.is_protected(self.key, **self.get_filters_for_instance())
+
+    @classmethod
+    def is_required(cls, key, **kwargs):
+        """Check if this setting value is required."""
+        setting = cls.get_setting_definition(key, **cls.get_filters(**kwargs))
+
+        return setting.get("required", False)
+
+    @property
+    def required(self):
+        """Returns if setting is required."""
+        return self.__class__.is_required(self.key, **self.get_filters_for_instance())
 
 
 def settings_group_options():
@@ -771,12 +914,43 @@ def update_instance_name(setting):
     site_obj.save()
 
 
+def validate_email_domains(setting):
+    """Validate the email domains setting."""
+    if not setting.value:
+        return
+
+    domains = setting.value.split(',')
+    for domain in domains:
+        if not domain:
+            raise ValidationError(_('An empty domain is not allowed.'))
+        if not re.match(r'^@[a-zA-Z0-9\.\-_]+$', domain):
+            raise ValidationError(_(f'Invalid domain name: {domain}'))
+
+
+def update_exchange_rates(setting):
+    """Update exchange rates when base currency is changed"""
+
+    if InvenTree.ready.isImportingData():
+        return
+
+    if not InvenTree.ready.canAppAccessDatabase():
+        return
+
+    InvenTree.tasks.update_exchange_rates()
+
+
 class InvenTreeSetting(BaseInvenTreeSetting):
     """An InvenTreeSetting object is a key:value pair used for storing single values (e.g. one-off settings values).
 
     The class provides a way of retrieving the value for a particular key,
     even if that key does not exist.
     """
+
+    class Meta:
+        """Meta options for InvenTreeSetting."""
+
+        verbose_name = "InvenTree Setting"
+        verbose_name_plural = "InvenTree Settings"
 
     def save(self, *args, **kwargs):
         """When saving a global setting, check to see if it requires a server restart.
@@ -851,9 +1025,10 @@ class InvenTreeSetting(BaseInvenTreeSetting):
 
         'INVENTREE_DEFAULT_CURRENCY': {
             'name': _('Default Currency'),
-            'description': _('Default currency'),
+            'description': _('Select base currency for pricing calculations'),
             'default': 'USD',
             'choices': CURRENCY_CHOICES,
+            'after_save': update_exchange_rates,
         },
 
         'INVENTREE_DOWNLOAD_FROM_URL': {
@@ -875,6 +1050,12 @@ class InvenTreeSetting(BaseInvenTreeSetting):
             ]
         },
 
+        'INVENTREE_DOWNLOAD_FROM_URL_USER_AGENT': {
+            'name': _('User-agent used to download from URL'),
+            'description': _('Allow to override the user-agent used to download images and files from external URL (leave blank for the default)'),
+            'default': '',
+        },
+
         'INVENTREE_REQUIRE_CONFIRM': {
             'name': _('Require confirm'),
             'description': _('Require explicit user confirmation for certain action.'),
@@ -892,18 +1073,40 @@ class InvenTreeSetting(BaseInvenTreeSetting):
             ]
         },
 
+        'INVENTREE_UPDATE_CHECK_INTERVAL': {
+            'name': _('Update Check Interval'),
+            'description': _('How often to check for updates (set to zero to disable)'),
+            'validator': [
+                int,
+                MinValueValidator(0),
+            ],
+            'default': 7,
+            'units': _('days'),
+        },
+
         'INVENTREE_BACKUP_ENABLE': {
             'name': _('Automatic Backup'),
             'description': _('Enable automatic backup of database and media files'),
             'validator': bool,
-            'default': True,
+            'default': False,
+        },
+
+        'INVENTREE_BACKUP_DAYS': {
+            'name': _('Auto Backup Interval'),
+            'description': _('Specify number of days between automated backup events'),
+            'validator': [
+                int,
+                MinValueValidator(1),
+            ],
+            'default': 1,
+            'units': _('days'),
         },
 
         'INVENTREE_DELETE_TASKS_DAYS': {
-            'name': _('Delete Old Tasks'),
+            'name': _('Task Deletion Interval'),
             'description': _('Background task results will be deleted after specified number of days'),
             'default': 30,
-            'units': 'days',
+            'units': _('days'),
             'validator': [
                 int,
                 MinValueValidator(7),
@@ -911,10 +1114,10 @@ class InvenTreeSetting(BaseInvenTreeSetting):
         },
 
         'INVENTREE_DELETE_ERRORS_DAYS': {
-            'name': _('Delete Error Logs'),
+            'name': _('Error Log Deletion Interval'),
             'description': _('Error logs will be deleted after specified number of days'),
             'default': 30,
-            'units': 'days',
+            'units': _('days'),
             'validator': [
                 int,
                 MinValueValidator(7)
@@ -922,10 +1125,10 @@ class InvenTreeSetting(BaseInvenTreeSetting):
         },
 
         'INVENTREE_DELETE_NOTIFICATIONS_DAYS': {
-            'name': _('Delete Noficiations'),
+            'name': _('Notification Deletion Interval'),
             'description': _('User notifications will be deleted after specified number of days'),
             'default': 30,
-            'units': 'days',
+            'units': _('days'),
             'validator': [
                 int,
                 MinValueValidator(7),
@@ -955,6 +1158,13 @@ class InvenTreeSetting(BaseInvenTreeSetting):
             'description': _('Allow barcode scanning via webcam in browser'),
             'default': True,
             'validator': bool,
+        },
+
+        'PART_ENABLE_REVISION': {
+            'name': _('Part Revisions'),
+            'description': _('Enable revision field for Part'),
+            'validator': bool,
+            'default': True,
         },
 
         'PART_IPN_REGEX': {
@@ -1068,9 +1278,16 @@ class InvenTreeSetting(BaseInvenTreeSetting):
         },
 
         'PART_CREATE_INITIAL': {
-            'name': _('Create initial stock'),
-            'description': _('Create initial stock on part creation'),
+            'name': _('Initial Stock Data'),
+            'description': _('Allow creation of initial stock when adding a new part'),
             'default': False,
+            'validator': bool,
+        },
+
+        'PART_CREATE_SUPPLIER': {
+            'name': _('Initial Supplier Data'),
+            'description': _('Allow creation of initial supplier data when adding a new part'),
+            'default': True,
             'validator': bool,
         },
 
@@ -1088,9 +1305,27 @@ class InvenTreeSetting(BaseInvenTreeSetting):
             'default': '',
         },
 
+        'PART_PARAMETER_ENFORCE_UNITS': {
+            'name': _('Enforce Parameter Units'),
+            'description': _('If units are provided, parameter values must match the specified units'),
+            'default': True,
+            'validator': bool,
+        },
+
+        'PRICING_DECIMAL_PLACES_MIN': {
+            'name': _('Minimum Pricing Decimal Places'),
+            'description': _('Minimum number of decimal places to display when rendering pricing data'),
+            'default': 0,
+            'validator': [
+                int,
+                MinValueValidator(0),
+                MaxValueValidator(4),
+            ]
+        },
+
         'PRICING_DECIMAL_PLACES': {
-            'name': _('Pricing Decimal Places'),
-            'description': _('Number of decimal places to display when rendering pricing data'),
+            'name': _('Maximum Pricing Decimal Places'),
+            'description': _('Maximum number of decimal places to display when rendering pricing data'),
             'default': 6,
             'validator': [
                 int,
@@ -1113,6 +1348,24 @@ class InvenTreeSetting(BaseInvenTreeSetting):
             'validator': bool,
         },
 
+        'PRICING_USE_STOCK_PRICING': {
+            'name': _('Use Stock Item Pricing'),
+            'description': _('Use pricing from manually entered stock data for pricing calculations'),
+            'default': True,
+            'validator': bool,
+        },
+
+        'PRICING_STOCK_ITEM_AGE_DAYS': {
+            'name': _('Stock Item Pricing Age'),
+            'description': _('Exclude stock items older than this number of days from pricing calculations'),
+            'default': 0,
+            'units': _('days'),
+            'validator': [
+                int,
+                MinValueValidator(0),
+            ]
+        },
+
         'PRICING_USE_VARIANT_PRICING': {
             'name': _('Use Variant Pricing'),
             'description': _('Include variant pricing in overall pricing calculations'),
@@ -1128,7 +1381,7 @@ class InvenTreeSetting(BaseInvenTreeSetting):
         },
 
         'PRICING_UPDATE_DAYS': {
-            'name': _('Pricing Rebuild Time'),
+            'name': _('Pricing Rebuild Interval'),
             'description': _('Number of days before part pricing is automatically updated'),
             'units': _('days'),
             'default': 30,
@@ -1222,6 +1475,13 @@ class InvenTreeSetting(BaseInvenTreeSetting):
             'validator': bool,
         },
 
+        'STOCK_DELETE_DEPLETED_DEFAULT': {
+            'name': _('Delete Depleted Stock'),
+            'description': _('Determines default behaviour when a stock item is depleted'),
+            'default': True,
+            'validator': bool,
+        },
+
         'STOCK_BATCH_CODE_TEMPLATE': {
             'name': _('Batch Code Template'),
             'description': _('Template for generating default batch codes for stock items'),
@@ -1270,11 +1530,39 @@ class InvenTreeSetting(BaseInvenTreeSetting):
             'default': '',
         },
 
+        'STOCK_SHOW_INSTALLED_ITEMS': {
+            'name': _('Show Installed Stock Items'),
+            'description': _('Display installed stock items in stock tables'),
+            'default': False,
+            'validator': bool,
+        },
+
         'BUILDORDER_REFERENCE_PATTERN': {
             'name': _('Build Order Reference Pattern'),
             'description': _('Required pattern for generating Build Order reference field'),
             'default': 'BO-{ref:04d}',
             'validator': build.validators.validate_build_order_reference_pattern,
+        },
+
+        'RETURNORDER_ENABLED': {
+            'name': _('Enable Return Orders'),
+            'description': _('Enable return order functionality in the user interface'),
+            'validator': bool,
+            'default': False,
+        },
+
+        'RETURNORDER_REFERENCE_PATTERN': {
+            'name': _('Return Order Reference Pattern'),
+            'description': _('Required pattern for generating Return Order reference field'),
+            'default': 'RMA-{ref:04d}',
+            'validator': order.validators.validate_return_order_reference_pattern,
+        },
+
+        'RETURNORDER_EDIT_COMPLETED_ORDERS': {
+            'name': _('Edit Completed Return Orders'),
+            'description': _('Allow editing of return orders after they have been completed'),
+            'default': False,
+            'validator': bool,
         },
 
         'SALESORDER_REFERENCE_PATTERN': {
@@ -1334,6 +1622,13 @@ class InvenTreeSetting(BaseInvenTreeSetting):
             'validator': bool,
         },
 
+        'LOGIN_ENABLE_SSO_REG': {
+            'name': _('Enable SSO registration'),
+            'description': _('Enable self-registration via SSO for users on the login pages'),
+            'default': False,
+            'validator': bool,
+        },
+
         'LOGIN_MAIL_REQUIRED': {
             'name': _('Email required'),
             'description': _('Require user to supply mail on signup'),
@@ -1362,6 +1657,13 @@ class InvenTreeSetting(BaseInvenTreeSetting):
             'validator': bool,
         },
 
+        'LOGIN_SIGNUP_MAIL_RESTRICTION': {
+            'name': _('Allowed domains'),
+            'description': _('Restrict signup to certain domains (comma-separated, starting with @)'),
+            'default': '',
+            'before_save': validate_email_domains,
+        },
+
         'SIGNUP_GROUP': {
             'name': _('Group on signup'),
             'description': _('Group to which new users are assigned on registration'),
@@ -1382,13 +1684,6 @@ class InvenTreeSetting(BaseInvenTreeSetting):
             'default': str(os.getenv('INVENTREE_DOCKER', False)).lower() in ['1', 'true'],
             'validator': bool,
             'requires_restart': True,
-        },
-
-        'PLUGIN_CHECK_SIGNATURES': {
-            'name': _('Check plugin signatures'),
-            'description': _('Check and show signatures for plugins'),
-            'default': False,
-            'validator': bool,
         },
 
         # Settings for plugin mixin features
@@ -1431,15 +1726,52 @@ class InvenTreeSetting(BaseInvenTreeSetting):
             'validator': bool,
             'requires_restart': True,
         },
+
+        "PROJECT_CODES_ENABLED": {
+            'name': _('Enable project codes'),
+            'description': _('Enable project codes for tracking projects'),
+            'default': False,
+            'validator': bool,
+        },
+
+        'STOCKTAKE_ENABLE': {
+            'name': _('Stocktake Functionality'),
+            'description': _('Enable stocktake functionality for recording stock levels and calculating stock value'),
+            'validator': bool,
+            'default': False,
+        },
+
+        'STOCKTAKE_EXCLUDE_EXTERNAL': {
+            'name': _('Exclude External Locations'),
+            'description': _('Exclude stock items in external locations from stocktake calculations'),
+            'validator': bool,
+            'default': False,
+        },
+
+        'STOCKTAKE_AUTO_DAYS': {
+            'name': _('Automatic Stocktake Period'),
+            'description': _('Number of days between automatic stocktake recording (set to zero to disable)'),
+            'validator': [
+                int,
+                MinValueValidator(0),
+            ],
+            'default': 0,
+        },
+
+        'STOCKTAKE_DELETE_REPORT_DAYS': {
+            'name': _('Report Deletion Interval'),
+            'description': _('Stocktake reports will be deleted after specified number of days'),
+            'default': 30,
+            'units': _('days'),
+            'validator': [
+                int,
+                MinValueValidator(7),
+            ]
+        },
+
     }
 
     typ = 'inventree'
-
-    class Meta:
-        """Meta options for InvenTreeSetting."""
-
-        verbose_name = "InvenTree Setting"
-        verbose_name_plural = "InvenTree Settings"
 
     key = models.CharField(
         max_length=50,
@@ -1462,10 +1794,36 @@ class InvenTreeSetting(BaseInvenTreeSetting):
             return False
 
 
+def label_printer_options():
+    """Build a list of available label printer options."""
+    printers = []
+    label_printer_plugins = registry.with_mixin('labels')
+    if label_printer_plugins:
+        printers.extend([(p.slug, p.name + ' - ' + p.human_name) for p in label_printer_plugins])
+    return printers
+
+
 class InvenTreeUserSetting(BaseInvenTreeSetting):
     """An InvenTreeSetting object with a usercontext."""
 
+    class Meta:
+        """Meta options for InvenTreeUserSetting."""
+
+        verbose_name = "InvenTree User Setting"
+        verbose_name_plural = "InvenTree User Settings"
+        constraints = [
+            models.UniqueConstraint(fields=['key', 'user'], name='unique key and user')
+        ]
+
     SETTINGS = {
+
+        'HOMEPAGE_HIDE_INACTIVE': {
+            'name': _('Hide inactive parts'),
+            'description': _('Hide inactive parts in results displayed on the homepage'),
+            'default': True,
+            'validator': bool,
+        },
+
         'HOMEPAGE_PART_STARRED': {
             'name': _('Show subscribed parts'),
             'description': _('Show subscribed parts on the homepage'),
@@ -1487,13 +1845,6 @@ class InvenTreeUserSetting(BaseInvenTreeSetting):
             'validator': bool,
         },
 
-        'PART_RECENT_COUNT': {
-            'name': _('Recent Part Count'),
-            'description': _('Number of recent parts to display on index page'),
-            'default': 10,
-            'validator': [int, MinValueValidator(1)]
-        },
-
         'HOMEPAGE_BOM_REQUIRES_VALIDATION': {
             'name': _('Show unvalidated BOMs'),
             'description': _('Show BOMs that await validation on the homepage'),
@@ -1506,13 +1857,6 @@ class InvenTreeUserSetting(BaseInvenTreeSetting):
             'description': _('Show recently changed stock items on the homepage'),
             'default': True,
             'validator': bool,
-        },
-
-        'STOCK_RECENT_COUNT': {
-            'name': _('Recent Stock Count'),
-            'description': _('Number of recent stock items to display on index page'),
-            'default': 10,
-            'validator': [int, MinValueValidator(1)]
         },
 
         'HOMEPAGE_STOCK_LOW': {
@@ -1592,6 +1936,13 @@ class InvenTreeUserSetting(BaseInvenTreeSetting):
             'validator': bool,
         },
 
+        'HOMEPAGE_SO_SHIPMENTS_PENDING': {
+            'name': _('Show pending SO shipments'),
+            'description': _('Show pending SO shipments on the homepage'),
+            'default': True,
+            'validator': bool,
+        },
+
         'HOMEPAGE_NEWS': {
             'name': _('Show News'),
             'description': _('Show news on the homepage'),
@@ -1604,6 +1955,13 @@ class InvenTreeUserSetting(BaseInvenTreeSetting):
             'description': _('Display PDF labels in the browser, instead of downloading as a file'),
             'default': True,
             'validator': bool,
+        },
+
+        "LABEL_DEFAULT_PRINTER": {
+            'name': _('Default label printer'),
+            'description': _('Configure which label printer should be selected by default'),
+            'default': '',
+            'choices': label_printer_options
         },
 
         "REPORT_INLINE": {
@@ -1621,7 +1979,7 @@ class InvenTreeUserSetting(BaseInvenTreeSetting):
         },
 
         'SEARCH_PREVIEW_SHOW_SUPPLIER_PARTS': {
-            'name': _('Seach Supplier Parts'),
+            'name': _('Search Supplier Parts'),
             'description': _('Display supplier parts in search preview window'),
             'default': True,
             'validator': bool,
@@ -1711,11 +2069,39 @@ class InvenTreeUserSetting(BaseInvenTreeSetting):
             'default': True,
         },
 
+        'SEARCH_PREVIEW_SHOW_RETURN_ORDERS': {
+            'name': _('Search Return Orders'),
+            'description': _('Display return orders in search preview window'),
+            'default': True,
+            'validator': bool,
+        },
+
+        'SEARCH_PREVIEW_EXCLUDE_INACTIVE_RETURN_ORDERS': {
+            'name': _('Exclude Inactive Return Orders'),
+            'description': _('Exclude inactive return orders from search preview window'),
+            'validator': bool,
+            'default': True,
+        },
+
         'SEARCH_PREVIEW_RESULTS': {
             'name': _('Search Preview Results'),
             'description': _('Number of results to show in each section of the search preview window'),
             'default': 10,
             'validator': [int, MinValueValidator(1)]
+        },
+
+        'SEARCH_REGEX': {
+            'name': _('Regex Search'),
+            'description': _('Enable regular expressions in search queries'),
+            'default': False,
+            'validator': bool,
+        },
+
+        'SEARCH_WHOLE': {
+            'name': _('Whole Word Search'),
+            'description': _('Search queries return results for whole word matches'),
+            'default': False,
+            'validator': bool,
         },
 
         'PART_SHOW_QUANTITY_IN_FORMS': {
@@ -1761,6 +2147,13 @@ class InvenTreeUserSetting(BaseInvenTreeSetting):
             'validator': bool,
         },
 
+        'DISPLAY_STOCKTAKE_TAB': {
+            'name': _('Part Stocktake'),
+            'description': _('Display part stocktake information (if stocktake functionality is enabled)'),
+            'default': True,
+            'validator': bool,
+        },
+
         'TABLE_STRING_MAX_LENGTH': {
             'name': _('Table String Length'),
             'description': _('Maximimum length limit for strings displayed in table views'),
@@ -1769,19 +2162,39 @@ class InvenTreeUserSetting(BaseInvenTreeSetting):
                 MinValueValidator(0),
             ],
             'default': 100,
-        }
+        },
+
+        'DEFAULT_PART_LABEL_TEMPLATE': {
+            'name': _('Default part label template'),
+            'description': _('The part label template to be automatically selected'),
+            'validator': [
+                int,
+            ],
+            'default': '',
+        },
+
+        'DEFAULT_ITEM_LABEL_TEMPLATE': {
+            'name': _('Default stock item template'),
+            'description': _('The stock item label template to be automatically selected'),
+            'validator': [
+                int,
+            ],
+            'default': '',
+        },
+
+        'DEFAULT_LOCATION_LABEL_TEMPLATE': {
+            'name': _('Default stock location label template'),
+            'description': _('The stock location label template to be automatically selected'),
+            'validator': [
+                int,
+            ],
+            'default': '',
+        },
+
     }
 
     typ = 'user'
-
-    class Meta:
-        """Meta options for InvenTreeUserSetting."""
-
-        verbose_name = "InvenTree User Setting"
-        verbose_name_plural = "InvenTree User Settings"
-        constraints = [
-            models.UniqueConstraint(fields=['key', 'user'], name='unique key and user')
-        ]
+    extra_unique_fields = ['user']
 
     key = models.CharField(
         max_length=50,
@@ -1798,22 +2211,12 @@ class InvenTreeUserSetting(BaseInvenTreeSetting):
         help_text=_('User'),
     )
 
-    def validate_unique(self, exclude=None, **kwargs):
-        """Return if the setting (including key) is unique."""
-        return super().validate_unique(exclude=exclude, user=self.user)
-
     def to_native_value(self):
         """Return the "pythonic" value, e.g. convert "True" to True, and "1" to 1."""
         return self.__class__.get_setting(self.key, user=self.user)
 
-    def get_kwargs(self):
-        """Explicit kwargs required to uniquely identify a particular setting object, in addition to the 'key' parameter."""
-        return {
-            'user': self.user,
-        }
 
-
-class PriceBreak(models.Model):
+class PriceBreak(MetaMixin):
     """Represents a PriceBreak model."""
 
     class Meta:
@@ -2048,7 +2451,7 @@ class WebhookEndpoint(models.Model):
         self.verify = self.VERIFICATION_METHOD
 
     def process_webhook(self):
-        """Process the webhook incomming.
+        """Process the webhook incoming.
 
         This does not deal with the data itself - that happens in process_payload.
         Do not touch or pickle data here - it was not verified to be safe.
@@ -2095,7 +2498,7 @@ class WebhookEndpoint(models.Model):
         """
         return WebhookMessage.objects.create(
             host=request.get_host(),
-            header=json.dumps({key: val for key, val in headers.items()}),
+            header=json.dumps(dict(headers.items())),
             body=payload,
             endpoint=self,
         )
@@ -2184,8 +2587,8 @@ class WebhookMessage(models.Model):
     )
 
 
-class NotificationEntry(models.Model):
-    """A NotificationEntry records the last time a particular notifaction was sent out.
+class NotificationEntry(MetaMixin):
+    """A NotificationEntry records the last time a particular notification was sent out.
 
     It is recorded to ensure that notifications are not sent out "too often" to users.
 
@@ -2208,11 +2611,6 @@ class NotificationEntry(models.Model):
     )
 
     uid = models.IntegerField(
-    )
-
-    updated = models.DateTimeField(
-        auto_now=True,
-        null=False,
     )
 
     @classmethod
@@ -2374,3 +2772,114 @@ class NewsFeedEntry(models.Model):
         help_text=_('Was this news item read?'),
         default=False
     )
+
+
+def rename_notes_image(instance, filename):
+    """Function for renaming uploading image file. Will store in the 'notes' directory."""
+
+    fname = os.path.basename(filename)
+    return os.path.join('notes', fname)
+
+
+class NotesImage(models.Model):
+    """Model for storing uploading images for the 'notes' fields of various models.
+
+    Simply stores the image file, for use in the 'notes' field (of any models which support markdown)
+    """
+
+    image = models.ImageField(
+        upload_to=rename_notes_image,
+        verbose_name=_('Image'),
+        help_text=_('Image file'),
+    )
+
+    user = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True)
+
+    date = models.DateTimeField(auto_now_add=True)
+
+
+class CustomUnit(models.Model):
+    """Model for storing custom physical unit definitions
+
+    Model Attributes:
+        name: Name of the unit
+        definition: Definition of the unit
+        symbol: Symbol for the unit (e.g. 'm' for 'metre') (optional)
+
+    Refer to the pint documentation for further information on unit definitions.
+    https://pint.readthedocs.io/en/stable/advanced/defining.html
+    """
+
+    def fmt_string(self):
+        """Construct a unit definition string e.g. 'dog_year = 52 * day = dy'"""
+        fmt = f'{self.name} = {self.definition}'
+
+        if self.symbol:
+            fmt += f' = {self.symbol}'
+
+        return fmt
+
+    def clean(self):
+        """Validate that the provided custom unit is indeed valid"""
+
+        super().clean()
+
+        from InvenTree.conversion import get_unit_registry
+
+        registry = get_unit_registry()
+
+        # Check that the 'name' field is valid
+        self.name = self.name.strip()
+
+        # Cannot be zero length
+        if not self.name.isidentifier():
+            raise ValidationError({
+                'name': _('Unit name must be a valid identifier')
+            })
+
+        self.definition = self.definition.strip()
+
+        # Check that the 'definition' is valid, by itself
+        try:
+            registry.Quantity(self.definition)
+        except Exception as exc:
+            raise ValidationError({
+                'definition': str(exc)
+            })
+
+        # Finally, test that the entire custom unit definition is valid
+        try:
+            registry.define(self.fmt_string())
+        except Exception as exc:
+            raise ValidationError(str(exc))
+
+    name = models.CharField(
+        max_length=50,
+        verbose_name=_('Name'),
+        help_text=_('Unit name'),
+        unique=True, blank=False,
+    )
+
+    symbol = models.CharField(
+        max_length=10,
+        verbose_name=_('Symbol'),
+        help_text=_('Optional unit symbol'),
+        unique=True, blank=True,
+    )
+
+    definition = models.CharField(
+        max_length=50,
+        verbose_name=_('Definition'),
+        help_text=_('Unit definition'),
+        blank=False,
+    )
+
+
+@receiver(post_save, sender=CustomUnit, dispatch_uid='custom_unit_saved')
+@receiver(post_delete, sender=CustomUnit, dispatch_uid='custom_unit_deleted')
+def after_custom_unit_updated(sender, instance, **kwargs):
+    """Callback when a custom unit is updated or deleted"""
+
+    # Force reload of the unit registry
+    from InvenTree.conversion import reload_unit_registry
+    reload_unit_registry()

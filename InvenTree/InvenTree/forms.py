@@ -21,8 +21,11 @@ from crispy_forms.bootstrap import (AppendedText, PrependedAppendedText,
                                     PrependedText)
 from crispy_forms.helper import FormHelper
 from crispy_forms.layout import Field, Layout
+from dj_rest_auth.registration.serializers import RegisterSerializer
+from rest_framework import serializers
 
 from common.models import InvenTreeSetting
+from InvenTree.exceptions import log_error
 
 logger = logging.getLogger('inventree')
 
@@ -125,6 +128,16 @@ class EditUserForm(HelperForm):
 class SetPasswordForm(HelperForm):
     """Form for setting user password."""
 
+    class Meta:
+        """Metaclass options."""
+
+        model = User
+        fields = [
+            'enter_password',
+            'confirm_password',
+            'old_password',
+        ]
+
     enter_password = forms.CharField(
         max_length=100,
         min_length=8,
@@ -150,16 +163,6 @@ class SetPasswordForm(HelperForm):
         strip=False,
         widget=forms.PasswordInput(attrs={'autocomplete': 'current-password', 'autofocus': True}),
     )
-
-    class Meta:
-        """Metaclass options."""
-
-        model = User
-        fields = [
-            'enter_password',
-            'confirm_password',
-            'old_password',
-        ]
 
 
 # override allauth
@@ -205,25 +208,59 @@ class CustomSignupForm(SignupForm):
         return cleaned_data
 
 
+def registration_enabled():
+    """Determine whether user registration is enabled."""
+    return settings.EMAIL_HOST and (InvenTreeSetting.get_setting('LOGIN_ENABLE_REG') or InvenTreeSetting.get_setting('LOGIN_ENABLE_SSO_REG'))
+
+
 class RegistratonMixin:
     """Mixin to check if registration should be enabled."""
 
     def is_open_for_signup(self, request, *args, **kwargs):
-        """Check if signup is enabled in settings."""
-        if settings.EMAIL_HOST and InvenTreeSetting.get_setting('LOGIN_ENABLE_REG', True):
+        """Check if signup is enabled in settings.
+
+        Configure the class variable `REGISTRATION_SETTING` to set which setting should be used, default: `LOGIN_ENABLE_REG`.
+        """
+        if registration_enabled():
             return super().is_open_for_signup(request, *args, **kwargs)
         return False
 
+    def clean_email(self, email):
+        """Check if the mail is valid to the pattern in LOGIN_SIGNUP_MAIL_RESTRICTION (if enabled in settings)."""
+        mail_restriction = InvenTreeSetting.get_setting('LOGIN_SIGNUP_MAIL_RESTRICTION', None)
+        if not mail_restriction:
+            return super().clean_email(email)
+
+        split_email = email.split('@')
+        if len(split_email) != 2:
+            logger.error(f'The user {email} has an invalid email address')
+            raise forms.ValidationError(_('The provided primary email address is not valid.'))
+
+        mailoptions = mail_restriction.split(',')
+        for option in mailoptions:
+            if not option.startswith('@'):
+                log_error('LOGIN_SIGNUP_MAIL_RESTRICTION is not configured correctly')
+                raise forms.ValidationError(_('The provided primary email address is not valid.'))
+            else:
+                if split_email[1] == option[1:]:
+                    return super().clean_email(email)
+
+        logger.info(f'The provided email domain for {email} is not approved')
+        raise forms.ValidationError(_('The provided email domain is not approved.'))
+
     def save_user(self, request, user, form, commit=True):
         """Check if a default group is set in settings."""
+        # Create the user
         user = super().save_user(request, user, form)
+
+        # Check if a default group is set in settings
         start_group = InvenTreeSetting.get_setting('SIGNUP_GROUP')
         if start_group:
             try:
                 group = Group.objects.get(id=start_group)
                 user.groups.add(group)
             except Group.DoesNotExist:
-                logger.error('The setting `SIGNUP_GROUP` contains an non existant group', start_group)
+                logger.error('The setting `SIGNUP_GROUP` contains an non existent group', start_group)
         user.save()
         return user
 
@@ -239,11 +276,30 @@ class CustomUrlMixin:
 
 class CustomAccountAdapter(CustomUrlMixin, RegistratonMixin, OTPAdapter, DefaultAccountAdapter):
     """Override of adapter to use dynamic settings."""
+
     def send_mail(self, template_prefix, email, context):
         """Only send mail if backend configured."""
         if settings.EMAIL_HOST:
-            return super().send_mail(template_prefix, email, context)
+            try:
+                result = super().send_mail(template_prefix, email, context)
+            except Exception:
+                # An exception occurred while attempting to send email
+                # Log it (for admin users) and return silently
+                log_error('account email')
+                result = False
+
+            return result
+
         return False
+
+    def get_email_confirmation_url(self, request, emailconfirmation):
+        """Construct the email confirmation url"""
+
+        from InvenTree.helpers_model import construct_absolute_url
+
+        url = super().get_email_confirmation_url(request, emailconfirmation)
+        url = construct_absolute_url(url)
+        return url
 
 
 class CustomSocialAccountAdapter(CustomUrlMixin, RegistratonMixin, DefaultSocialAccountAdapter):
@@ -279,3 +335,20 @@ class CustomSocialAccountAdapter(CustomUrlMixin, RegistratonMixin, DefaultSocial
 
         # Otherwise defer to the original allauth adapter.
         return super().login(request, user)
+
+
+# override dj-rest-auth
+class CustomRegisterSerializer(RegisterSerializer):
+    """Override of serializer to use dynamic settings."""
+    email = serializers.EmailField()
+
+    def __init__(self, instance=None, data=..., **kwargs):
+        """Check settings to influence which fields are needed."""
+        kwargs['email_required'] = InvenTreeSetting.get_setting('LOGIN_MAIL_REQUIRED')
+        super().__init__(instance, data, **kwargs)
+
+    def save(self, request):
+        """Override to check if registration is open."""
+        if registration_enabled():
+            return super().save(request)
+        raise forms.ValidationError(_('Registration is disabled.'))

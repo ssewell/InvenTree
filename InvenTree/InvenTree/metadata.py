@@ -7,6 +7,7 @@ from rest_framework.fields import empty
 from rest_framework.metadata import SimpleMetadata
 from rest_framework.utils import model_meta
 
+import InvenTree.permissions
 import users.models
 from InvenTree.helpers import str2bool
 
@@ -27,7 +28,7 @@ class InvenTreeMetadata(SimpleMetadata):
     """
 
     def determine_metadata(self, request, view):
-        """Overwrite the metadata to adapt to hte request user."""
+        """Overwrite the metadata to adapt to the request user."""
         self.request = request
         self.view = view
 
@@ -35,7 +36,7 @@ class InvenTreeMetadata(SimpleMetadata):
 
         """
         Custom context information to pass through to the OPTIONS endpoint,
-        if the "context=True" is supplied to the OPTIONS requst
+        if the "context=True" is supplied to the OPTIONS request
 
         Serializer class can supply context data by defining a get_context_data() method (no arguments)
         """
@@ -58,7 +59,7 @@ class InvenTreeMetadata(SimpleMetadata):
 
         try:
             # Extract the model name associated with the view
-            self.model = view.serializer_class.Meta.model
+            self.model = InvenTree.permissions.get_model_for_view(view)
 
             # Construct the 'table name' from the model
             app_label = self.model._meta.app_label
@@ -256,7 +257,7 @@ class InvenTreeMetadata(SimpleMetadata):
             if isinstance(field, serializers.PrimaryKeyRelatedField):
                 model = field.queryset.model
             else:
-                logger.debug("Could not extract model for:", field_info['label'], '->', field)
+                logger.debug("Could not extract model for:", field_info.get('label'), '->', field)
                 model = None
 
             if model:

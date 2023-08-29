@@ -14,7 +14,7 @@ from django.urls.base import reverse
 from django.utils.text import slugify
 from django.utils.translation import gettext_lazy as _
 
-from plugin.helpers import GitStatus, get_git_log
+from plugin.helpers import get_git_log
 
 logger = logging.getLogger("inventree")
 
@@ -32,7 +32,7 @@ class MetaBase:
 
         Args:
             key (str): key for the value
-            old_key (str, optional): depreceated key - will throw warning
+            old_key (str, optional): deprecated key - will throw warning
             __default (optional): Value if nothing with key can be found. Defaults to None.
 
         Returns:
@@ -46,7 +46,7 @@ class MetaBase:
 
             # Sound of a warning if old_key worked
             if value:
-                warnings.warn(f'Usage of {old_key} was depreciated in 0.7.0 in favour of {key}', DeprecationWarning)
+                warnings.warn(f'Usage of {old_key} was depreciated in 0.7.0 in favour of {key}', DeprecationWarning, stacklevel=2)
 
         # Use __default if still nothing set
         if (value is None) and __default:
@@ -161,19 +161,29 @@ class MixinBase:
         self._mixinreg[key] = {
             'key': key,
             'human_name': human_name,
+            'cls': cls,
         }
+
+    def get_registered_mixins(self, with_base: bool = False, with_cls: bool = True):
+        """Get all registered mixins for the plugin."""
+        mixins = getattr(self, '_mixinreg', None)
+        if not mixins:
+            return {}
+
+        mixins = mixins.copy()
+        # filter out base
+        if not with_base and 'base' in mixins:
+            del mixins['base']
+
+        # Do not return the mixin class if flas is set
+        if not with_cls:
+            return {key: {k: v for k, v in mixin.items() if k != 'cls'} for key, mixin in mixins.items()}
+        return mixins
 
     @property
     def registered_mixins(self, with_base: bool = False):
         """Get all registered mixins for the plugin."""
-        mixins = getattr(self, '_mixinreg', None)
-        if mixins:
-            # filter out base
-            if not with_base and 'base' in mixins:
-                del mixins['base']
-            # only return dict
-            mixins = [a for a in mixins.values()]
-        return mixins
+        return self.get_registered_mixins(with_base=with_base)
 
 
 class VersionMixin:
@@ -265,8 +275,7 @@ class InvenTreePlugin(VersionMixin, MixinBase, MetaBase):
             pub_date = self.package.get('date')
         else:
             pub_date = datetime.fromisoformat(str(pub_date))
-        if not pub_date:
-            pub_date = _('No date found')  # pragma: no cover
+
         return pub_date
 
     @property
@@ -339,6 +348,7 @@ class InvenTreePlugin(VersionMixin, MixinBase, MetaBase):
     # region package info
     def _get_package_commit(self):
         """Get last git commit for the plugin."""
+
         return get_git_log(str(self.file()))
 
     @classmethod
@@ -364,11 +374,16 @@ class InvenTreePlugin(VersionMixin, MixinBase, MetaBase):
                 # Not much information we can extract at this point
                 return {}
 
+        try:
+            website = meta['Project-URL'].split(', ')[1]
+        except (ValueError, IndexError, AttributeError, ):
+            website = meta['Project-URL']
+
         return {
             'author': meta['Author-email'],
             'description': meta['Summary'],
             'version': meta['Version'],
-            'website': meta['Project-URL'],
+            'website': website,
             'license': meta['License']
         }
 
@@ -380,16 +395,6 @@ class InvenTreePlugin(VersionMixin, MixinBase, MetaBase):
         if package.get('date'):
             package['date'] = datetime.fromisoformat(package.get('date'))
 
-        # process sign state
-        sign_state = getattr(GitStatus, str(package.get('verified')), GitStatus.N)
-        if sign_state.status == 0:
-            self.sign_color = 'success'  # pragma: no cover
-        elif sign_state.status == 1:
-            self.sign_color = 'warning'
-        else:
-            self.sign_color = 'danger'  # pragma: no cover
-
         # set variables
         self.package = package
-        self.sign_state = sign_state
     # endregion

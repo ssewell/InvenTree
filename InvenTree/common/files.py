@@ -59,7 +59,8 @@ class FileManager:
                 # Reset stream position to beginning of file
                 file.seek(0)
             else:
-                raise ValidationError(_(f'Unsupported file format: {ext.upper()}'))
+                fmt = ext.upper()
+                raise ValidationError(_(f'Unsupported file format: {fmt}'))
         except UnicodeEncodeError:
             raise ValidationError(_('Error reading file (invalid encoding)'))
 
@@ -83,7 +84,7 @@ class FileManager:
         self.HEADERS = self.REQUIRED_HEADERS + self.ITEM_MATCH_HEADERS + self.OPTIONAL_MATCH_HEADERS + self.OPTIONAL_HEADERS
 
     def setup(self):
-        """Setup headers should be overriden in usage to set the Different Headers."""
+        """Setup headers should be overridden in usage to set the Different Headers."""
         if not self.name:
             return
 
@@ -180,7 +181,7 @@ class FileManager:
 
         for i in range(self.row_count()):
 
-            data = [item for item in self.get_row_data(i)]
+            data = list(self.get_row_data(i))
 
             # Is the row completely empty? Skip!
             empty = True

@@ -4,9 +4,9 @@ from django.contrib import admin
 
 from import_export.admin import ImportExportModelAdmin
 from import_export.fields import Field
-import import_export.widgets as widgets
+from import_export import widgets
 
-from build.models import Build, BuildItem
+from build.models import Build, BuildLine, BuildItem
 from InvenTree.admin import InvenTreeResource
 import part.models
 
@@ -17,7 +17,18 @@ class BuildResource(InvenTreeResource):
     # but we don't for other ones.
     # TODO: 2022-05-12 - Need to investigate why this is the case!
 
-    id = Field(attribute='pk')
+    class Meta:
+        """Metaclass options"""
+        models = Build
+        skip_unchanged = True
+        report_skipped = False
+        clean_model_instances = True
+        exclude = [
+            'lft', 'rght', 'tree_id', 'level',
+            'metadata',
+        ]
+
+    id = Field(attribute='pk', widget=widgets.IntegerWidget())
 
     reference = Field(attribute='reference')
 
@@ -38,17 +49,6 @@ class BuildResource(InvenTreeResource):
     batch = Field(attribute='batch')
 
     notes = Field(attribute='notes')
-
-    class Meta:
-        """Metaclass options"""
-        models = Build
-        skip_unchanged = True
-        report_skipped = False
-        clean_model_instances = True
-        exclude = [
-            'lft', 'rght', 'tree_id', 'level',
-            'metadata',
-        ]
 
 
 class BuildAdmin(ImportExportModelAdmin):
@@ -87,18 +87,33 @@ class BuildItemAdmin(admin.ModelAdmin):
     """Class for managing the BuildItem model via the admin interface"""
 
     list_display = (
-        'build',
         'stock_item',
         'quantity'
     )
 
     autocomplete_fields = [
-        'build',
-        'bom_item',
+        'build_line',
         'stock_item',
         'install_into',
     ]
 
 
+class BuildLineAdmin(admin.ModelAdmin):
+    """Class for managing the BuildLine model via the admin interface"""
+
+    list_display = (
+        'build',
+        'bom_item',
+        'quantity',
+    )
+
+    search_fields = [
+        'build__title',
+        'build__reference',
+        'bom_item__sub_part__name',
+    ]
+
+
 admin.site.register(Build, BuildAdmin)
 admin.site.register(BuildItem, BuildItemAdmin)
+admin.site.register(BuildLine, BuildLineAdmin)

@@ -7,7 +7,6 @@ import sys
 
 from django.conf import settings
 from django.core.cache import cache
-from django.core.exceptions import FieldError, ValidationError
 from django.core.validators import FileExtensionValidator
 from django.db import models
 from django.template import Context, Template
@@ -21,6 +20,9 @@ import order.models
 import part.models
 import stock.models
 from InvenTree.helpers import validateFilterString
+from InvenTree.helpers_model import get_base_url
+from InvenTree.models import MetadataMixin
+from plugin.registry import registry
 
 try:
     from django_weasyprint import WeasyTemplateResponseMixin
@@ -65,6 +67,16 @@ def validate_purchase_order_filters(filters):
 def validate_sales_order_filters(filters):
     """Validate filter string against SalesOrder model."""
     return validateFilterString(filters, model=order.models.SalesOrder)
+
+
+def validate_return_order_filters(filters):
+    """Validate filter string against ReturnOrder model"""
+    return validateFilterString(filters, model=order.models.ReturnOrder)
+
+
+def validate_stock_location_report_filters(filters):
+    """Validate filter string against StockLocation model."""
+    return validateFilterString(filters, model=stock.models.StockLocation)
 
 
 class WeasyprintReportMixin(WeasyTemplateResponseMixin):
@@ -174,11 +186,15 @@ class ReportBase(models.Model):
     )
 
 
-class ReportTemplateBase(ReportBase):
+class ReportTemplateBase(MetadataMixin, ReportBase):
     """Reporting template model.
 
     Able to be passed context data
     """
+
+    class Meta:
+        """Metaclass options. Abstract ensures no database table is created."""
+        abstract = True
 
     # Pass a single top-level object to the report template
     object_to_print = None
@@ -192,7 +208,7 @@ class ReportTemplateBase(ReportBase):
         # Generate custom context data based on the particular report subclass
         context = self.get_context_data(request)
 
-        context['base_url'] = common.models.InvenTreeSetting.get_setting('INVENTREE_BASE_URL')
+        context['base_url'] = get_base_url(request=request)
         context['date'] = datetime.datetime.now().date()
         context['datetime'] = datetime.datetime.now()
         context['default_page_size'] = common.models.InvenTreeSetting.get_setting('REPORT_DEFAULT_PAGE_SIZE')
@@ -201,6 +217,13 @@ class ReportTemplateBase(ReportBase):
         context['report_revision'] = self.revision
         context['request'] = request
         context['user'] = request.user
+
+        # Pass the context through to any active reporting plugins
+        plugins = registry.with_mixin('report')
+
+        for plugin in plugins:
+            # Let each plugin add its own context data
+            plugin.add_report_context(self, self.object_to_print, request, context)
 
         return context
 
@@ -255,11 +278,6 @@ class ReportTemplateBase(ReportBase):
         help_text=_('Report template is enabled'),
     )
 
-    class Meta:
-        """Metaclass options. Abstract ensures no database table is created."""
-
-        abstract = True
-
 
 class TestReport(ReportTemplateBase):
     """Render a TestReport against a StockItem object."""
@@ -290,18 +308,29 @@ class TestReport(ReportTemplateBase):
         help_text=_('Include test results for stock items installed inside assembled item')
     )
 
-    def matches_stock_item(self, item):
-        """Test if this report template matches a given StockItem objects."""
-        try:
-            filters = validateFilterString(self.filters)
-            items = stock.models.StockItem.objects.filter(**filters)
-        except (ValidationError, FieldError):
-            return False
+    def get_test_keys(self, stock_item):
+        """Construct a flattened list of test 'keys' for this StockItem:
 
-        # Ensure the provided StockItem object matches the filters
-        items = items.filter(pk=item.pk)
+        - First, any 'required' tests
+        - Second, any 'non required' tests
+        - Finally, any test results which do not match a test
+        """
 
-        return items.exists()
+        keys = []
+
+        for test in stock_item.part.getTestTemplates(required=True):
+            if test.key not in keys:
+                keys.append(test.key)
+
+        for test in stock_item.part.getTestTemplates(required=False):
+            if test.key not in keys:
+                keys.append(test.key)
+
+        for result in stock_item.testResultList(include_installed=self.include_installed):
+            if result.key not in keys:
+                keys.append(result.key)
+
+        return list(keys)
 
     def get_context_data(self, request):
         """Return custom context data for the TestReport template"""
@@ -312,6 +341,9 @@ class TestReport(ReportTemplateBase):
             'serial': stock_item.serial,
             'part': stock_item.part,
             'parameters': stock_item.part.parameters_map(),
+            'test_keys': self.get_test_keys(stock_item),
+            'test_template_list': stock_item.part.getTestTemplates(),
+            'test_template_map': stock_item.part.getTestTemplateMap(),
             'results': stock_item.testResultMap(include_installed=self.include_installed),
             'result_list': stock_item.testResultList(include_installed=self.include_installed),
             'installed_items': stock_item.get_installed_items(cascade=True),
@@ -345,12 +377,14 @@ class BuildReport(ReportTemplateBase):
         """Custom context data for the build report."""
         my_build = self.object_to_print
 
-        if type(my_build) != build.models.Build:
+        if not isinstance(my_build, build.models.Build):
             raise TypeError('Provided model is not a Build object')
 
         return {
             'build': my_build,
             'part': my_build.part,
+            'build_outputs': my_build.build_outputs.all(),
+            'line_items': my_build.build_lines.all(),
             'bom_items': my_build.part.get_bom_items(),
             'reference': my_build.reference,
             'quantity': my_build.quantity,
@@ -368,7 +402,7 @@ class BillOfMaterialsReport(ReportTemplateBase):
 
     @classmethod
     def getSubdir(cls):
-        """Retun the directory where BillOfMaterialsReport templates are located"""
+        """Return the directory where BillOfMaterialsReport templates are located"""
         return 'bom'
 
     filters = models.CharField(
@@ -440,7 +474,7 @@ class SalesOrderReport(ReportTemplateBase):
 
     @classmethod
     def getSubdir(cls):
-        """Retun the subdirectory where SalesOrderReport templates are located"""
+        """Return the subdirectory where SalesOrderReport templates are located"""
         return 'salesorder'
 
     filters = models.CharField(
@@ -464,6 +498,45 @@ class SalesOrderReport(ReportTemplateBase):
             'extra_lines': order.extra_lines,
             'order': order,
             'reference': order.reference,
+            'title': str(order),
+        }
+
+
+class ReturnOrderReport(ReportTemplateBase):
+    """Render a custom report against a ReturnOrder object"""
+
+    @staticmethod
+    def get_api_url():
+        """Return the API URL associated with the ReturnOrderReport model"""
+        return reverse('api-return-order-report-list')
+
+    @classmethod
+    def getSubdir(cls):
+        """Return the directory where the ReturnOrderReport templates are stored"""
+        return 'returnorder'
+
+    filters = models.CharField(
+        blank=True,
+        max_length=250,
+        verbose_name=_('Filters'),
+        help_text=_('Return order query filters'),
+        validators=[
+            validate_return_order_filters,
+        ]
+    )
+
+    def get_context_data(self, request):
+        """Return custom context data for the ReturnOrderReport template"""
+
+        order = self.object_to_print
+
+        return {
+            'order': order,
+            'description': order.description,
+            'reference': order.reference,
+            'customer': order.customer,
+            'lines': order.lines,
+            'extra_lines': order.extra_lines,
             'title': str(order),
         }
 
@@ -551,3 +624,39 @@ class ReportAsset(models.Model):
         verbose_name=_('Description'),
         help_text=_("Asset file description")
     )
+
+
+class StockLocationReport(ReportTemplateBase):
+    """Render a StockLocationReport against a StockLocation object."""
+
+    @staticmethod
+    def get_api_url():
+        """Return the API URL associated with the StockLocationReport model"""
+        return reverse('api-stocklocation-report-list')
+
+    @classmethod
+    def getSubdir(cls):
+        """Return the subdirectory where StockLocationReport templates are located"""
+        return 'slr'
+
+    filters = models.CharField(
+        blank=True,
+        max_length=250,
+        verbose_name=_('Filters'),
+        help_text=_("stock location query filters (comma-separated list of key=value pairs)"),
+        validators=[
+            validate_stock_location_report_filters
+        ]
+    )
+
+    def get_context_data(self, request):
+        """Return custom context data for the StockLocationReport template"""
+        stock_location = self.object_to_print
+
+        if not isinstance(stock_location, stock.models.StockLocation):
+            raise TypeError('Provided model is not a StockLocation object -> ' + str(type(stock_location)))
+
+        return {
+            'stock_location': stock_location,
+            'stock_items': stock_location.get_stock_items(),
+        }

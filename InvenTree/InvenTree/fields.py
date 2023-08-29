@@ -4,7 +4,7 @@ import sys
 from decimal import Decimal
 
 from django import forms
-from django.db import models as models
+from django.db import models
 from django.utils.translation import gettext_lazy as _
 
 from djmoney.forms.fields import MoneyField
@@ -19,6 +19,7 @@ from .validators import AllowedURLValidator, allowable_url_schemes
 
 class InvenTreeRestURLField(RestURLField):
     """Custom field for DRF with custom scheme vaildators."""
+
     def __init__(self, **kwargs):
         """Update schemes."""
 
@@ -111,6 +112,7 @@ class InvenTreeModelMoneyField(ModelMoneyField):
 
 class InvenTreeMoneyField(MoneyField):
     """Custom MoneyField for clean migrations while using dynamic currency settings."""
+
     def __init__(self, *args, **kwargs):
         """Override initial values with the real info from database."""
         kwargs.update(money_kwargs())

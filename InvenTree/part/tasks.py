@@ -1,17 +1,25 @@
 """Background task definitions for the 'part' app"""
 
+
 import logging
+import random
+import time
 from datetime import datetime, timedelta
 
+from django.core.exceptions import ValidationError
 from django.utils.translation import gettext_lazy as _
 
 import common.models
 import common.notifications
 import common.settings
+import company.models
 import InvenTree.helpers
+import InvenTree.helpers_model
 import InvenTree.tasks
 import part.models
-from InvenTree.tasks import ScheduledTask, scheduled_task
+import part.stocktake
+from InvenTree.tasks import (ScheduledTask, check_daily_holdoff,
+                             record_task_success, scheduled_task)
 
 logger = logging.getLogger("inventree")
 
@@ -28,7 +36,7 @@ def notify_low_stock(part: part.models.Part):
         'part': part,
         'name': name,
         'message': message,
-        'link': InvenTree.helpers.construct_absolute_url(part.get_absolute_url()),
+        'link': InvenTree.helpers_model.construct_absolute_url(part.get_absolute_url()),
         'template': {
             'html': 'email/low_stock_notification.html',
             'subject': name,
@@ -125,3 +133,105 @@ def check_missing_pricing(limit=250):
             pricing = p.pricing
             pricing.save()
             pricing.schedule_for_update()
+
+
+@scheduled_task(ScheduledTask.DAILY)
+def scheduled_stocktake_reports():
+    """Scheduled tasks for creating automated stocktake reports.
+
+    This task runs daily, and performs the following functions:
+
+    - Delete 'old' stocktake report files after the specified period
+    - Generate new reports at the specified period
+    """
+
+    # Sleep a random number of seconds to prevent worker conflict
+    time.sleep(random.randint(1, 5))
+
+    # First let's delete any old stocktake reports
+    delete_n_days = int(common.models.InvenTreeSetting.get_setting('STOCKTAKE_DELETE_REPORT_DAYS', 30, cache=False))
+    threshold = datetime.now() - timedelta(days=delete_n_days)
+    old_reports = part.models.PartStocktakeReport.objects.filter(date__lt=threshold)
+
+    if old_reports.count() > 0:
+        logger.info(f"Deleting {old_reports.count()} stale stocktake reports")
+        old_reports.delete()
+
+    # Next, check if stocktake functionality is enabled
+    if not common.models.InvenTreeSetting.get_setting('STOCKTAKE_ENABLE', False, cache=False):
+        logger.info("Stocktake functionality is not enabled - exiting")
+        return
+
+    report_n_days = int(common.models.InvenTreeSetting.get_setting('STOCKTAKE_AUTO_DAYS', 0, cache=False))
+
+    if report_n_days < 1:
+        logger.info("Stocktake auto reports are disabled, exiting")
+        return
+
+    if not check_daily_holdoff('STOCKTAKE_RECENT_REPORT', report_n_days):
+        logger.info("Stocktake report was recently generated - exiting")
+        return
+
+    # Let's start a new stocktake report for all parts
+    part.stocktake.generate_stocktake_report(update_parts=True)
+
+    # Record the date of this report
+    record_task_success('STOCKTAKE_RECENT_REPORT')
+
+
+def rebuild_parameters(template_id):
+    """Rebuild all parameters for a given template.
+
+    This function is called when a base template is changed,
+    which may cause the base unit to be adjusted.
+    """
+
+    try:
+        template = part.models.PartParameterTemplate.objects.get(pk=template_id)
+    except part.models.PartParameterTemplate.DoesNotExist:
+        return
+
+    parameters = part.models.PartParameter.objects.filter(template=template)
+
+    n = 0
+
+    for parameter in parameters:
+        # Update the parameter if the numeric value has changed
+        value_old = parameter.data_numeric
+        parameter.calculate_numeric_value()
+
+        if value_old != parameter.data_numeric:
+            parameter.full_clean()
+            parameter.save()
+            n += 1
+
+    if n > 0:
+        logger.info(f"Rebuilt {n} parameters for template '{template.name}'")
+
+
+def rebuild_supplier_parts(part_id):
+    """Rebuild all SupplierPart objects for a given part.
+
+    This function is called when a bart part is changed,
+    which may cause the native units of any supplier parts to be updated
+    """
+
+    try:
+        prt = part.models.Part.objects.get(pk=part_id)
+    except part.models.Part.DoesNotExist:
+        return
+
+    supplier_parts = company.models.SupplierPart.objects.filter(part=prt)
+
+    n = supplier_parts.count()
+
+    for supplier_part in supplier_parts:
+        # Re-save the part, to ensure that the units have updated correctly
+        try:
+            supplier_part.full_clean()
+            supplier_part.save()
+        except ValidationError:
+            pass
+
+    if n > 0:
+        logger.info(f"Rebuilt {n} supplier parts for part '{prt.name}'")

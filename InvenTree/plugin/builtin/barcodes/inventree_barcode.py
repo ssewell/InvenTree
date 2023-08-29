@@ -11,19 +11,18 @@ import json
 
 from django.utils.translation import gettext_lazy as _
 
-from company.models import SupplierPart
 from InvenTree.helpers import hash_barcode
-from part.models import Part
+from InvenTree.helpers_model import getModelsWithMixin
+from InvenTree.models import InvenTreeBarcodeMixin
 from plugin import InvenTreePlugin
 from plugin.mixins import BarcodeMixin
-from stock.models import StockItem, StockLocation
 
 
 class InvenTreeInternalBarcodePlugin(BarcodeMixin, InvenTreePlugin):
     """Builtin BarcodePlugin for matching and generating internal barcodes."""
 
     NAME = "InvenTreeBarcode"
-    TITLE = _("Inventree Barcodes")
+    TITLE = _("InvenTree Barcodes")
     DESCRIPTION = _("Provides native support for barcodes")
     VERSION = "2.0.0"
     AUTHOR = _("InvenTree contributors")
@@ -32,12 +31,7 @@ class InvenTreeInternalBarcodePlugin(BarcodeMixin, InvenTreePlugin):
     def get_supported_barcode_models():
         """Returns a list of database models which support barcode functionality"""
 
-        return [
-            Part,
-            StockItem,
-            StockLocation,
-            SupplierPart,
-        ]
+        return getModelsWithMixin(InvenTreeBarcodeMixin)
 
     def format_matched_response(self, label, model, instance):
         """Format a response for the scanned data"""
@@ -55,7 +49,7 @@ class InvenTreeInternalBarcodePlugin(BarcodeMixin, InvenTreePlugin):
             url = instance.get_absolute_url()
             data['web_url'] = url
         else:
-            url = None
+            url = None  # pragma: no cover
 
         response = {
             label: data
@@ -94,7 +88,8 @@ class InvenTreeInternalBarcodePlugin(BarcodeMixin, InvenTreePlugin):
 
                 if label in barcode_dict:
                     try:
-                        instance = model.objects.get(pk=barcode_dict[label])
+                        pk = int(barcode_dict[label])
+                        instance = model.objects.get(pk=pk)
                         return self.format_matched_response(label, model, instance)
                     except (ValueError, model.DoesNotExist):
                         pass

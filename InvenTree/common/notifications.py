@@ -8,8 +8,8 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.utils.translation import gettext_lazy as _
 
+import common.models
 import InvenTree.helpers
-from common.models import NotificationEntry, NotificationMessage
 from InvenTree.ready import isImportingData
 from plugin import registry
 from plugin.models import NotificationUserSetting, PluginConfig
@@ -62,11 +62,11 @@ class NotificationMethod:
     def check_context(self, context):
         """Check that all values defined in the methods CONTEXT were provided in the current context."""
         def check(ref, obj):
-            # the obj is not accesible so we are on the end
+            # the obj is not accessible so we are on the end
             if not isinstance(obj, (list, dict, tuple, )):
                 return ref
 
-            # check if the ref exsists
+            # check if the ref exists
             if isinstance(ref, str):
                 if not obj.get(ref):
                     return ref
@@ -150,16 +150,16 @@ class SingleNotificationMethod(NotificationMethod):
     """NotificationMethod that sends notifications one by one."""
 
     def send(self, target):
-        """This function must be overriden."""
-        raise NotImplementedError('The `send` method must be overriden!')
+        """This function must be overridden."""
+        raise NotImplementedError('The `send` method must be overridden!')
 
 
 class BulkNotificationMethod(NotificationMethod):
     """NotificationMethod that sends all notifications in bulk."""
 
     def send_bulk(self):
-        """This function must be overriden."""
-        raise NotImplementedError('The `send` method must be overriden!')
+        """This function must be overridden."""
+        raise NotImplementedError('The `send` method must be overridden!')
 # endregion
 
 
@@ -180,7 +180,7 @@ class MethodStorageClass:
         Args:
             selected_classes (class, optional): References to the classes that should be registered. Defaults to None.
         """
-        logger.info('collecting notification methods')
+        logger.debug('Collecting notification methods')
         current_method = InvenTree.helpers.inheritors(NotificationMethod) - IGNORED_NOTIFICATION_CLS
 
         # for testing selective loading is made available
@@ -192,10 +192,11 @@ class MethodStorageClass:
         for item in current_method:
             plugin = item.get_plugin(item)
             ref = f'{plugin.package_path}_{item.METHOD_NAME}' if plugin else item.METHOD_NAME
+            item.plugin = plugin() if plugin else None
             filtered_list[ref] = item
 
         storage.liste = list(filtered_list.values())
-        logger.info(f'found {len(storage.liste)} notification methods')
+        logger.info(f'Found {len(storage.liste)} notification methods')
 
     def get_usersettings(self, user) -> list:
         """Returns all user settings for a specific user.
@@ -230,10 +231,7 @@ class MethodStorageClass:
         return methods
 
 
-IGNORED_NOTIFICATION_CLS = set([
-    SingleNotificationMethod,
-    BulkNotificationMethod,
-])
+IGNORED_NOTIFICATION_CLS = {SingleNotificationMethod, BulkNotificationMethod, }
 storage = MethodStorageClass()
 
 
@@ -249,7 +247,7 @@ class UIMessageNotification(SingleNotificationMethod):
 
     def send(self, target):
         """Send a UI notification to a user."""
-        NotificationMessage.objects.create(
+        common.models.NotificationMessage.objects.create(
             target_object=self.obj,
             source_object=target,
             user=target,
@@ -270,7 +268,7 @@ class NotificationBody:
         message (str): Notification message as text. Should not be longer than 120 chars.
         template (str): Reference to the html template for the notification.
 
-    The strings support f-string sytle fomratting with context variables parsed at runtime.
+    The strings support f-string style formatting with context variables parsed at runtime.
 
     Context variables:
         instance: Text representing the instance
@@ -281,7 +279,7 @@ class NotificationBody:
     name: str
     slug: str
     message: str
-    template: str
+    template: str = None
 
 
 class InvenTreeNotificationBodies:
@@ -302,6 +300,13 @@ class InvenTreeNotificationBodies:
         slug='purchase_order.items_received',
         message=_('Items have been received against a purchase order'),
         template='email/purchase_order_received.html',
+    )
+
+    ReturnOrderItemsReceived = NotificationBody(
+        name=_('Items Received'),
+        slug='return_order.items_received',
+        message=_('Items have been received against a return order'),
+        template='email/return_order_received.html',
     )
 
 
@@ -333,7 +338,7 @@ def trigger_notification(obj, category=None, obj_ref='pk', **kwargs):
     # Check if we have notified recently...
     delta = timedelta(days=1)
 
-    if NotificationEntry.check_recent(category, obj_ref_value, delta):
+    if common.models.NotificationEntry.check_recent(category, obj_ref_value, delta):
         logger.info(f"Notification '{category}' has recently been sent for '{str(obj)}' - SKIPPING")
         return
 
@@ -393,7 +398,7 @@ def trigger_notification(obj, category=None, obj_ref='pk', **kwargs):
                 logger.error(error)
 
         # Set delivery flag
-        NotificationEntry.notify(category, obj_ref_value)
+        common.models.NotificationEntry.notify(category, obj_ref_value)
     else:
         logger.info(f"No possible users for notification '{category}'")
 
@@ -416,7 +421,7 @@ def trigger_superuser_notification(plugin: PluginConfig, msg: str):
             'message': msg,
         },
         targets=users,
-        delivery_methods=set([UIMessageNotification]),
+        delivery_methods={UIMessageNotification, },
     )
 
 

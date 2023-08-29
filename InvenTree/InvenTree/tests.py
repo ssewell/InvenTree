@@ -3,6 +3,7 @@
 import json
 import os
 import time
+from datetime import datetime, timedelta
 from decimal import Decimal
 from unittest import mock
 
@@ -10,38 +11,158 @@ import django.core.exceptions as django_exceptions
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.sites.models import Site
+from django.core import mail
 from django.core.exceptions import ValidationError
 from django.test import TestCase, override_settings
+from django.urls import reverse
 
-import requests
+import pint.errors
 from djmoney.contrib.exchange.exceptions import MissingRate
 from djmoney.contrib.exchange.models import Rate, convert_money
 from djmoney.money import Money
+from sesame.utils import get_user
 
+import InvenTree.conversion
 import InvenTree.format
 import InvenTree.helpers
+import InvenTree.helpers_model
 import InvenTree.tasks
-from common.models import InvenTreeSetting
+from common.models import CustomUnit, InvenTreeSetting
 from common.settings import currency_codes
 from InvenTree.sanitizer import sanitize_svg
+from InvenTree.unit_test import InvenTreeTestCase
 from part.models import Part, PartCategory
 from stock.models import StockItem, StockLocation
 
 from . import config, helpers, ready, status, version
 from .tasks import offload_task
-from .validators import validate_overage, validate_part_name
+from .validators import validate_overage
+
+
+class ConversionTest(TestCase):
+    """Tests for conversion of physical units"""
+
+    def test_base_units(self):
+        """Test conversion to specified base units"""
+        tests = {
+            "3": 3,
+            "3 dozen": 36,
+            "50 dozen kW": 600000,
+            "1 / 10": 0.1,
+            "1/2 kW": 500,
+            "1/2 dozen kW": 6000,
+            "0.005 MW": 5000,
+        }
+
+        for val, expected in tests.items():
+            q = InvenTree.conversion.convert_physical_value(val, 'W')
+
+            self.assertAlmostEqual(q, expected, 0.01)
+
+            q = InvenTree.conversion.convert_physical_value(val, 'W', strip_units=False)
+            self.assertAlmostEqual(float(q.magnitude), expected, 0.01)
+
+    def test_dimensionless_units(self):
+        """Tests for 'dimensonless' unit quantities"""
+
+        # Test some dimensionless units
+        tests = {
+            'ea': 1,
+            'each': 1,
+            '3 piece': 3,
+            '5 dozen': 60,
+            '3 hundred': 300,
+            '2 thousand': 2000,
+            '12 pieces': 12,
+            '1 / 10': 0.1,
+            '1/2': 0.5,
+            '-1 / 16': -0.0625,
+            '3/2': 1.5,
+            '1/2 dozen': 6,
+        }
+
+        for val, expected in tests.items():
+            # Convert, and leave units
+            q = InvenTree.conversion.convert_physical_value(val, strip_units=False)
+            self.assertAlmostEqual(float(q.magnitude), expected, 0.01)
+
+            # Convert, and strip units
+            q = InvenTree.conversion.convert_physical_value(val)
+            self.assertAlmostEqual(q, expected, 0.01)
+
+    def test_invalid_values(self):
+        """Test conversion of invalid inputs"""
+
+        inputs = [
+            '-',
+            ';;',
+            '-x',
+            '?',
+            '--',
+            '+',
+            '++',
+            '1/0',
+            '1/-',
+        ]
+
+        for val in inputs:
+            # Test with a provided unit
+            with self.assertRaises(ValidationError):
+                InvenTree.conversion.convert_physical_value(val, 'meter')
+
+            # Test dimensionless
+            with self.assertRaises(ValidationError):
+                result = InvenTree.conversion.convert_physical_value(val)
+                print("Testing invalid value:", val, result)
+
+    def test_custom_units(self):
+        """Tests for custom unit conversion"""
+
+        # Start with an empty set of units
+        CustomUnit.objects.all().delete()
+        InvenTree.conversion.reload_unit_registry()
+
+        # Ensure that the custom unit does *not* exist to start with
+        reg = InvenTree.conversion.get_unit_registry()
+
+        with self.assertRaises(pint.errors.UndefinedUnitError):
+            reg['hpmm']
+
+        # Create a new custom unit
+        CustomUnit.objects.create(
+            name='fanciful_unit',
+            definition='henry / mm',
+            symbol='hpmm',
+        )
+
+        # Reload registry
+        reg = InvenTree.conversion.get_unit_registry()
+
+        # Ensure that the custom unit is now available
+        reg['hpmm']
+
+        # Convert some values
+        tests = {
+            '1': 1,
+            '1 hpmm': 1000000,
+            '1 / 10 hpmm': 100000,
+            '1 / 100 hpmm': 10000,
+            '0.3 hpmm': 300000,
+            '-7hpmm': -7000000,
+        }
+
+        for val, expected in tests.items():
+            # Convert, and leave units
+            q = InvenTree.conversion.convert_physical_value(val, 'henry / km', strip_units=False)
+            self.assertAlmostEqual(float(q.magnitude), expected, 0.01)
+
+            # Convert and strip units
+            q = InvenTree.conversion.convert_physical_value(val, 'henry / km')
+            self.assertAlmostEqual(q, expected, 0.01)
 
 
 class ValidatorTest(TestCase):
     """Simple tests for custom field validators."""
-
-    def test_part_name(self):
-        """Test part name validator."""
-        validate_part_name('hello world')
-
-        # Validate with some strange chars
-        with self.assertRaises(django_exceptions.ValidationError):
-            validate_part_name('### <> This | name is not } valid')
 
     def test_overage(self):
         """Test overage validator."""
@@ -199,6 +320,34 @@ class FormatTest(TestCase):
 class TestHelpers(TestCase):
     """Tests for InvenTree helper functions."""
 
+    def test_absolute_url(self):
+        """Test helper function for generating an absolute URL"""
+
+        base = "https://demo.inventree.org:12345"
+
+        InvenTreeSetting.set_setting('INVENTREE_BASE_URL', base, change_user=None)
+
+        tests = {
+            "": base,
+            "api/": base + "/api/",
+            "/api/": base + "/api/",
+            "api": base + "/api",
+            "media/label/output/": base + "/media/label/output/",
+            "static/logo.png": base + "/static/logo.png",
+            "https://www.google.com": "https://www.google.com",
+            "https://demo.inventree.org:12345/out.html": "https://demo.inventree.org:12345/out.html",
+            "https://demo.inventree.org/test.html": "https://demo.inventree.org/test.html",
+            "http://www.cwi.nl:80/%7Eguido/Python.html": "http://www.cwi.nl:80/%7Eguido/Python.html",
+            "test.org": base + "/test.org",
+        }
+
+        for url, expected in tests.items():
+            # Test with supplied base URL
+            self.assertEqual(InvenTree.helpers_model.construct_absolute_url(url, site_url=base), expected)
+
+            # Test without supplied base URL
+            self.assertEqual(InvenTree.helpers_model.construct_absolute_url(url), expected)
+
     def test_image_url(self):
         """Test if a filename looks like an image."""
         for name in ['ape.png', 'bat.GiF', 'apple.WeBP', 'BiTMap.Bmp']:
@@ -266,12 +415,12 @@ class TestHelpers(TestCase):
             "\\invalid-url"
         ]:
             with self.assertRaises(django_exceptions.ValidationError):
-                helpers.download_image_from_url(url)
+                InvenTree.helpers_model.download_image_from_url(url)
 
         def dl_helper(url, expected_error, timeout=2.5, retries=3):
             """Helper function for unit testing downloads.
 
-            As the httpstat.us service occassionaly refuses a connection,
+            As the httpstat.us service occasionally refuses a connection,
             we will simply try multiple times
             """
 
@@ -281,7 +430,7 @@ class TestHelpers(TestCase):
                 while tries < retries:
 
                     try:
-                        helpers.download_image_from_url(url, timeout=timeout)
+                        InvenTree.helpers_model.download_image_from_url(url, timeout=timeout)
                         break
                     except Exception as exc:
                         if type(exc) is expected_error:
@@ -294,10 +443,12 @@ class TestHelpers(TestCase):
                     time.sleep(10 * tries)
 
         # Attempt to download an image which throws a 404
-        dl_helper("https://httpstat.us/404", requests.exceptions.HTTPError, timeout=10)
+        # TODO: Re-implement this test when we are happier with the external service
+        # dl_helper("https://httpstat.us/404", requests.exceptions.HTTPError, timeout=10)
 
         # Attempt to download, but timeout
-        dl_helper("https://httpstat.us/200?sleep=5000", requests.exceptions.ReadTimeout, timeout=1)
+        # TODO: Re-implement this test when we are happier with the external service
+        # dl_helper("https://httpstat.us/200?sleep=5000", requests.exceptions.ReadTimeout, timeout=1)
 
         large_img = "https://github.com/inventree/InvenTree/raw/master/InvenTree/InvenTree/static/img/paper_splash_large.jpg"
 
@@ -305,13 +456,27 @@ class TestHelpers(TestCase):
 
         # Attempt to download an image which is too large
         with self.assertRaises(ValueError):
-            helpers.download_image_from_url(large_img, timeout=10)
+            InvenTree.helpers_model.download_image_from_url(large_img, timeout=10)
 
         # Increase allowable download size
         InvenTreeSetting.set_setting('INVENTREE_DOWNLOAD_IMAGE_MAX_SIZE', 5, change_user=None)
 
         # Download a valid image (should not throw an error)
-        helpers.download_image_from_url(large_img, timeout=10)
+        InvenTree.helpers_model.download_image_from_url(large_img, timeout=10)
+
+    def test_model_mixin(self):
+        """Test the getModelsWithMixin function"""
+
+        from InvenTree.models import InvenTreeBarcodeMixin
+
+        models = InvenTree.helpers_model.getModelsWithMixin(InvenTreeBarcodeMixin)
+
+        self.assertIn(Part, models)
+        self.assertIn(StockLocation, models)
+        self.assertIn(StockItem, models)
+
+        self.assertNotIn(PartCategory, models)
+        self.assertNotIn(InvenTreeSetting, models)
 
 
 class TestQuoteWrap(TestCase):
@@ -398,10 +563,10 @@ class TestMPTT(TestCase):
         'location',
     ]
 
-    def setUp(self):
+    @classmethod
+    def setUpTestData(cls):
         """Setup for all tests."""
-        super().setUp()
-
+        super().setUpTestData()
         StockLocation.objects.rebuild()
 
     def test_self_as_parent(self):
@@ -509,7 +674,7 @@ class TestSerialNumberExtraction(TestCase):
         self.assertEqual(sn, ['5', '6', '7', '8'])
 
     def test_failures(self):
-        """Test wron serial numbers."""
+        """Test wrong serial numbers."""
         e = helpers.extract_serial_numbers
 
         # Test duplicates
@@ -703,7 +868,7 @@ class TestStatus(TestCase):
         self.assertEqual(ready.isImportingData(), False)
 
 
-class TestSettings(helpers.InvenTreeTestCase):
+class TestSettings(InvenTreeTestCase):
     """Unit tests for settings."""
 
     superuser = True
@@ -799,7 +964,7 @@ class TestSettings(helpers.InvenTreeTestCase):
             'inventree/data/config.yaml',
         ]
 
-        self.assertTrue(any([opt in str(config.get_config_file()).lower() for opt in valid]))
+        self.assertTrue(any(opt in str(config.get_config_file()).lower() for opt in valid))
 
         # with env set
         with self.in_env_context({'INVENTREE_CONFIG_FILE': 'my_special_conf.yaml'}):
@@ -814,7 +979,7 @@ class TestSettings(helpers.InvenTreeTestCase):
             'inventree/data/plugins.txt',
         ]
 
-        self.assertTrue(any([opt in str(config.get_plugin_file()).lower() for opt in valid]))
+        self.assertTrue(any(opt in str(config.get_plugin_file()).lower() for opt in valid))
 
         # with env set
         with self.in_env_context({'INVENTREE_PLUGIN_FILE': 'my_special_plugins.txt'}):
@@ -830,8 +995,19 @@ class TestSettings(helpers.InvenTreeTestCase):
         with self.in_env_context({TEST_ENV_NAME: '321'}):
             self.assertEqual(config.get_setting(TEST_ENV_NAME, None), '321')
 
+        # test typecasting to dict - None should be mapped to empty dict
+        self.assertEqual(config.get_setting(TEST_ENV_NAME, None, None, typecast=dict), {})
 
-class TestInstanceName(helpers.InvenTreeTestCase):
+        # test typecasting to dict - valid JSON string should be mapped to corresponding dict
+        with self.in_env_context({TEST_ENV_NAME: '{"a": 1}'}):
+            self.assertEqual(config.get_setting(TEST_ENV_NAME, None, typecast=dict), {"a": 1})
+
+        # test typecasting to dict - invalid JSON string should be mapped to empty dict
+        with self.in_env_context({TEST_ENV_NAME: "{'a': 1}"}):
+            self.assertEqual(config.get_setting(TEST_ENV_NAME, None, typecast=dict), {})
+
+
+class TestInstanceName(InvenTreeTestCase):
     """Unit tests for instance name."""
 
     def test_instance_name(self):
@@ -859,7 +1035,7 @@ class TestInstanceName(helpers.InvenTreeTestCase):
         self.assertEqual(site_obj.domain, 'http://127.1.2.3')
 
 
-class TestOffloadTask(helpers.InvenTreeTestCase):
+class TestOffloadTask(InvenTreeTestCase):
     """Tests for offloading tasks to the background worker"""
 
     fixtures = [
@@ -903,8 +1079,60 @@ class TestOffloadTask(helpers.InvenTreeTestCase):
             force_async=True
         )
 
+    def test_daily_holdoff(self):
+        """Tests for daily task holdoff helper functions"""
 
-class BarcodeMixinTest(helpers.InvenTreeTestCase):
+        import InvenTree.tasks
+
+        with self.assertLogs(logger='inventree', level='INFO') as cm:
+            # With a non-positive interval, task will not run
+            result = InvenTree.tasks.check_daily_holdoff('some_task', 0)
+            self.assertFalse(result)
+            self.assertIn('Specified interval', str(cm.output))
+
+        with self.assertLogs(logger='inventree', level='INFO') as cm:
+            # First call should run without issue
+            result = InvenTree.tasks.check_daily_holdoff('dummy_task')
+            self.assertTrue(result)
+            self.assertIn("Logging task attempt for 'dummy_task'", str(cm.output))
+
+        with self.assertLogs(logger='inventree', level='INFO') as cm:
+            # An attempt has been logged, but it is too recent
+            result = InvenTree.tasks.check_daily_holdoff('dummy_task')
+            self.assertFalse(result)
+            self.assertIn("Last attempt for 'dummy_task' was too recent", str(cm.output))
+
+        # Mark last attempt a few days ago - should now return True
+        t_old = datetime.now() - timedelta(days=3)
+        t_old = t_old.isoformat()
+        InvenTreeSetting.set_setting('_dummy_task_ATTEMPT', t_old, None)
+
+        result = InvenTree.tasks.check_daily_holdoff('dummy_task', 5)
+        self.assertTrue(result)
+
+        # Last attempt should have been updated
+        self.assertNotEqual(t_old, InvenTreeSetting.get_setting('_dummy_task_ATTEMPT', '', cache=False))
+
+        # Last attempt should prevent us now
+        with self.assertLogs(logger='inventree', level='INFO') as cm:
+            result = InvenTree.tasks.check_daily_holdoff('dummy_task')
+            self.assertFalse(result)
+            self.assertIn("Last attempt for 'dummy_task' was too recent", str(cm.output))
+
+        # Configure so a task was successful too recently
+        InvenTreeSetting.set_setting('_dummy_task_ATTEMPT', t_old, None)
+        InvenTreeSetting.set_setting('_dummy_task_SUCCESS', t_old, None)
+
+        with self.assertLogs(logger='inventree', level='INFO') as cm:
+            result = InvenTree.tasks.check_daily_holdoff('dummy_task', 7)
+            self.assertFalse(result)
+            self.assertIn('Last successful run for', str(cm.output))
+
+            result = InvenTree.tasks.check_daily_holdoff('dummy_task', 2)
+            self.assertTrue(result)
+
+
+class BarcodeMixinTest(InvenTreeTestCase):
     """Tests for the InvenTreeBarcodeMixin mixin class"""
 
     def test_barcode_model_type(self):
@@ -937,7 +1165,7 @@ class SanitizerTest(TestCase):
     """Simple tests for sanitizer functions."""
 
     def test_svg_sanitizer(self):
-        """Test that SVGs are sanitized acordingly."""
+        """Test that SVGs are sanitized accordingly."""
         valid_string = """<svg xmlns="http://www.w3.org/2000/svg" version="1.1" id="svg2" height="400" width="400">{0}
         <path id="path1" d="m -151.78571,359.62883 v 112.76373 l 97.068507,-56.04253 V 303.14815 Z" style="fill:#ddbc91;"></path>
         </svg>"""
@@ -948,3 +1176,41 @@ class SanitizerTest(TestCase):
 
         # Test that invalid string is cleanded
         self.assertNotEqual(dangerous_string, sanitize_svg(dangerous_string))
+
+
+class MagicLoginTest(InvenTreeTestCase):
+    """Test magic login token generation."""
+
+    def test_generation(self):
+        """Test that magic login tokens are generated correctly"""
+
+        # User does not exists
+        resp = self.client.post(reverse('sesame-generate'), {'email': 1})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data, {'status': 'ok'})
+        self.assertEqual(len(mail.outbox), 0)
+
+        # User exists
+        resp = self.client.post(reverse('sesame-generate'), {'email': self.user.email})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data, {'status': 'ok'})
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].subject, '[example.com] Log in to the app')
+
+        # Check that the token is in the email
+        self.assertTrue('http://testserver/api/email/login/' in mail.outbox[0].body)
+        token = mail.outbox[0].body.split('/')[-1].split('\n')[0][8:]
+        self.assertEqual(get_user(token), self.user)
+
+        # Log user off
+        self.client.logout()
+
+        # Check that the login works
+        resp = self.client.get(reverse('sesame-login') + '?sesame=' + token)
+        self.assertEqual(resp.status_code, 302)
+        self.assertEqual(resp.url, '/index/')
+        # Note: 2023-08-08 - This test has been changed because "platform UI" is not generally available yet
+        # TODO: In the future, the URL comparison will need to be reverted
+        # self.assertEqual(resp.url, '/platform/logged-in/')
+        # And we should be logged in again
+        self.assertEqual(resp.wsgi_request.user, self.user)

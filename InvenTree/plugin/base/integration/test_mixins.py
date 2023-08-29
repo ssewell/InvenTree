@@ -8,7 +8,7 @@ from django.urls import include, re_path, reverse
 
 from error_report.models import Error
 
-from InvenTree.helpers import InvenTreeTestCase
+from InvenTree.unit_test import InvenTreeTestCase
 from plugin import InvenTreePlugin
 from plugin.base.integration.mixins import PanelMixin
 from plugin.helpers import MixinNotImplementedError
@@ -24,9 +24,9 @@ class BaseMixinDefinition:
     def test_mixin_name(self):
         """Test that the mixin registers itseld correctly."""
         # mixin name
-        self.assertIn(self.MIXIN_NAME, [item['key'] for item in self.mixin.registered_mixins])
+        self.assertIn(self.MIXIN_NAME, {item['key'] for item in self.mixin.registered_mixins.values()})
         # human name
-        self.assertIn(self.MIXIN_HUMAN_NAME, [item['human_name'] for item in self.mixin.registered_mixins])
+        self.assertIn(self.MIXIN_HUMAN_NAME, {item['human_name'] for item in self.mixin.registered_mixins.values()})
 
 
 class SettingsMixinTest(BaseMixinDefinition, InvenTreeTestCase):
@@ -270,6 +270,11 @@ class APICallMixinTest(BaseMixinDefinition, TestCase):
 
         self.assertTrue(result)
         self.assertEqual(result['name'], 'morpheus')
+
+        # api_call with endpoint with leading slash
+        result = self.mixin.api_call('/orgs/inventree', simple_response=False)
+        self.assertTrue(result)
+        self.assertEqual(result.reason, 'OK')
 
         # api_call with filter
         result = self.mixin.api_call('repos/inventree/InvenTree/stargazers', url_args={'page': '2'})

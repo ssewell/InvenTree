@@ -2,7 +2,7 @@
 
 from django.core.exceptions import ObjectDoesNotExist
 
-from djmoney.contrib.exchange.models import ExchangeBackend, Rate
+from djmoney.contrib.exchange.models import convert_money
 from djmoney.money import Money
 
 import common.models
@@ -10,51 +10,30 @@ import common.settings
 import company.models
 import order.models
 import part.models
-from InvenTree.helpers import InvenTreeTestCase
+import stock.models
 from InvenTree.status_codes import PurchaseOrderStatus
+from InvenTree.unit_test import InvenTreeTestCase
 
 
 class PartPricingTests(InvenTreeTestCase):
     """Unit tests for part pricing calculations"""
 
-    def generate_exchange_rates(self):
-        """Generate some exchange rates to work with"""
-
-        rates = {
-            'AUD': 1.5,
-            'CAD': 1.7,
-            'GBP': 0.9,
-            'USD': 1.0,
-        }
-
-        # Create a dummy backend
-        ExchangeBackend.objects.create(
-            name='InvenTreeExchange',
-            base_currency='USD',
-        )
-
-        backend = ExchangeBackend.objects.get(name='InvenTreeExchange')
-
-        for currency, rate in rates.items():
-            Rate.objects.create(
-                currency=currency,
-                value=rate,
-                backend=backend,
-            )
-
     def setUp(self):
         """Setup routines"""
+
+        super().setUp()
 
         self.generate_exchange_rates()
 
         # Create a new part for performing pricing calculations
+        # We will use 'metres' for the UOM here
+        # Some SupplierPart instances will have different units!
         self.part = part.models.Part.objects.create(
             name='PP',
-            description='A part with pricing',
-            assembly=True
+            description='A part with pricing, measured in metres',
+            assembly=True,
+            units='m'
         )
-
-        return super().setUp()
 
     def create_price_breaks(self):
         """Create some price breaks for the part, in various currencies"""
@@ -69,7 +48,11 @@ class PartPricingTests(InvenTreeTestCase):
             supplier=self.supplier_1,
             part=self.part,
             SKU='SUP_1',
+            pack_quantity='200 cm',
         )
+
+        # Native pack quantity should be 2m
+        self.assertEqual(self.sp_1.pack_quantity_native, 2)
 
         company.models.SupplierPriceBreak.objects.create(
             part=self.sp_1,
@@ -88,15 +71,21 @@ class PartPricingTests(InvenTreeTestCase):
             supplier=self.supplier_2,
             part=self.part,
             SKU='SUP_2',
-            pack_size=2.5,
+            pack_quantity='2.5',
         )
+
+        # Native pack quantity should be 2.5m
+        self.assertEqual(self.sp_2.pack_quantity_native, 2.5)
 
         self.sp_3 = company.models.SupplierPart.objects.create(
             supplier=self.supplier_2,
             part=self.part,
             SKU='SUP_3',
-            pack_size=10
+            pack_quantity='10 inches',
         )
+
+        # Native pack quantity should be 0.254m
+        self.assertEqual(self.sp_3.pack_quantity_native, 0.254)
 
         company.models.SupplierPriceBreak.objects.create(
             part=self.sp_2,
@@ -187,8 +176,8 @@ class PartPricingTests(InvenTreeTestCase):
 
         pricing.update_pricing()
 
-        self.assertEqual(pricing.overall_min, Money('2.014667', 'USD'))
-        self.assertEqual(pricing.overall_max, Money('6.117647', 'USD'))
+        self.assertAlmostEqual(float(pricing.overall_min.amount), 2.015, places=2)
+        self.assertAlmostEqual(float(pricing.overall_max.amount), 3.06, places=2)
 
         # Delete all supplier parts and re-calculate
         self.part.supplier_parts.all().delete()
@@ -233,6 +222,54 @@ class PartPricingTests(InvenTreeTestCase):
             # Maximum cost should stay the same
             self.assertEqual(pricing.internal_cost_max, Money(10, currency))
             self.assertEqual(pricing.overall_max, Money(10, currency))
+
+    def test_stock_item_pricing(self):
+        """Test for stock item pricing data"""
+
+        # Create a part
+        p = part.models.Part.objects.create(
+            name='Test part for pricing',
+            description='hello world, this is a part description',
+        )
+
+        # Create some stock items
+        prices = [
+            (10, 'AUD'),
+            (5, 'USD'),
+            (2, 'CAD'),
+        ]
+
+        for price, currency in prices:
+
+            stock.models.StockItem.objects.create(
+                part=p,
+                quantity=10,
+                purchase_price=price,
+                purchase_price_currency=currency
+            )
+
+        # Ensure that initially, stock item pricing is disabled
+        common.models.InvenTreeSetting.set_setting('PRICING_USE_STOCK_PRICING', False, None)
+
+        pricing = p.pricing
+        pricing.update_pricing()
+
+        # Check that stock item pricing data is not used
+        self.assertIsNone(pricing.purchase_cost_min)
+        self.assertIsNone(pricing.purchase_cost_max)
+        self.assertIsNone(pricing.overall_min)
+        self.assertIsNone(pricing.overall_max)
+
+        # Turn on stock pricing
+        common.models.InvenTreeSetting.set_setting('PRICING_USE_STOCK_PRICING', True, None)
+
+        pricing.update_pricing()
+
+        self.assertIsNotNone(pricing.purchase_cost_min)
+        self.assertIsNotNone(pricing.purchase_cost_max)
+
+        self.assertEqual(pricing.overall_min, Money(1.176471, 'USD'))
+        self.assertEqual(pricing.overall_max, Money(6.666667, 'USD'))
 
     def test_bom_pricing(self):
         """Unit test for BOM pricing calculations"""
@@ -296,11 +333,11 @@ class PartPricingTests(InvenTreeTestCase):
 
         # Add some line items to the order
 
-        # $5 AUD each
+        # $5 AUD each @ 2.5m per unit = $2 AUD per metre
         line_1 = po.add_line_item(self.sp_2, quantity=10, purchase_price=Money(5, 'AUD'))
 
-        # $30 CAD each (but pack_size is 10, so really $3 CAD each)
-        line_2 = po.add_line_item(self.sp_3, quantity=5, purchase_price=Money(30, 'CAD'))
+        # $3 CAD each @ 10 inches per unit = $0.3 CAD per inch = $11.81 CAD per metre
+        line_2 = po.add_line_item(self.sp_3, quantity=5, purchase_price=Money(3, 'CAD'))
 
         pricing.update_purchase_cost()
 
@@ -308,7 +345,7 @@ class PartPricingTests(InvenTreeTestCase):
         self.assertIsNone(pricing.purchase_cost_min)
         self.assertIsNone(pricing.purchase_cost_max)
 
-        po.status = PurchaseOrderStatus.COMPLETE
+        po.status = PurchaseOrderStatus.COMPLETE.value
         po.save()
 
         pricing.update_purchase_cost()
@@ -326,8 +363,20 @@ class PartPricingTests(InvenTreeTestCase):
 
         pricing.update_purchase_cost()
 
-        self.assertEqual(pricing.purchase_cost_min, Money('1.333333', 'USD'))
-        self.assertEqual(pricing.purchase_cost_max, Money('1.764706', 'USD'))
+        min_cost_aud = convert_money(pricing.purchase_cost_min, 'AUD')
+        max_cost_cad = convert_money(pricing.purchase_cost_max, 'CAD')
+
+        # Min cost in AUD = $2 AUD per metre
+        self.assertAlmostEqual(float(min_cost_aud.amount), 2, places=2)
+
+        # Min cost in USD
+        self.assertAlmostEqual(float(pricing.purchase_cost_min.amount), 1.3333, places=2)
+
+        # Max cost in CAD = $11.81 CAD per metre
+        self.assertAlmostEqual(float(max_cost_cad.amount), 11.81, places=2)
+
+        # Max cost in USD
+        self.assertAlmostEqual(float(pricing.purchase_cost_max.amount), 6.95, places=2)
 
     def test_delete_with_pricing(self):
         """Test for deleting a part which has pricing information"""
@@ -395,7 +444,42 @@ class PartPricingTests(InvenTreeTestCase):
         # Check that PartPricing objects have been created
         self.assertEqual(part.models.PartPricing.objects.count(), 101)
 
-        # Check that background-tasks have been created
-        from django_q.models import OrmQ
+    def test_delete_part_with_stock_items(self):
+        """Test deleting a part instance with stock items.
 
-        self.assertEqual(OrmQ.objects.count(), 101)
+        This is to test a specific edge condition which was discovered that caused an IntegrityError.
+        Ref: https://github.com/inventree/InvenTree/issues/4419
+
+        Essentially a series of on_delete listeners caused a new PartPricing object to be created,
+        but it pointed to a Part instance which was slated to be deleted inside an atomic transaction.
+        """
+
+        p = part.models.Part.objects.create(
+            name="my part",
+            description="my part description",
+            active=False,
+        )
+
+        # Create some stock items
+        for _idx in range(3):
+            stock.models.StockItem.objects.create(
+                part=p,
+                quantity=10,
+                purchase_price=Money(10, 'USD')
+            )
+
+        # Manually schedule a pricing update (does not happen automatically in testing)
+        p.schedule_pricing_update(create=True, test=True)
+
+        # Check that a PartPricing object exists
+        self.assertTrue(part.models.PartPricing.objects.filter(part=p).exists())
+
+        # Delete the part
+        p.delete()
+
+        # Check that the PartPricing object has been deleted
+        self.assertFalse(part.models.PartPricing.objects.filter(part=p).exists())
+
+        # Try to update pricing (should fail gracefully as the Part has been deleted)
+        p.schedule_pricing_update(create=False, test=True)
+        self.assertFalse(part.models.PartPricing.objects.filter(part=p).exists())

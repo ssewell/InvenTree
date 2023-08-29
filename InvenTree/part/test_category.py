@@ -19,15 +19,19 @@ class CategoryTest(TestCase):
         'params',
     ]
 
-    def setUp(self):
+    @classmethod
+    def setUpTestData(cls):
         """Extract some interesting categories for time-saving"""
-        self.electronics = PartCategory.objects.get(name='Electronics')
-        self.mechanical = PartCategory.objects.get(name='Mechanical')
-        self.resistors = PartCategory.objects.get(name='Resistors')
-        self.capacitors = PartCategory.objects.get(name='Capacitors')
-        self.fasteners = PartCategory.objects.get(name='Fasteners')
-        self.ic = PartCategory.objects.get(name='IC')
-        self.transceivers = PartCategory.objects.get(name='Transceivers')
+
+        super().setUpTestData()
+
+        cls.electronics = PartCategory.objects.get(name='Electronics')
+        cls.mechanical = PartCategory.objects.get(name='Mechanical')
+        cls.resistors = PartCategory.objects.get(name='Resistors')
+        cls.capacitors = PartCategory.objects.get(name='Capacitors')
+        cls.fasteners = PartCategory.objects.get(name='Fasteners')
+        cls.ic = PartCategory.objects.get(name='IC')
+        cls.transceivers = PartCategory.objects.get(name='Transceivers')
 
     def test_parents(self):
         """Test that the parent fields are properly set, based on the test fixtures."""
@@ -45,14 +49,14 @@ class CategoryTest(TestCase):
         self.assertEqual(len(self.electronics.children.all()), 3)
         self.assertEqual(len(self.mechanical.children.all()), 1)
 
-    def test_unique_childs(self):
+    def test_unique_children(self):
         """Test the 'unique_children' functionality."""
-        childs = [item.pk for item in self.electronics.getUniqueChildren()]
+        children = [item.pk for item in self.electronics.getUniqueChildren()]
 
-        self.assertIn(self.transceivers.id, childs)
-        self.assertIn(self.ic.id, childs)
+        self.assertIn(self.transceivers.id, children)
+        self.assertIn(self.ic.id, children)
 
-        self.assertNotIn(self.fasteners.id, childs)
+        self.assertNotIn(self.fasteners.id, children)
 
     def test_unique_parents(self):
         """Test the 'unique_parents' functionality."""
@@ -140,7 +144,15 @@ class CategoryTest(TestCase):
         self.assertEqual(self.electronics.partcount(), 3)
 
         self.assertEqual(self.mechanical.partcount(), 9)
+        self.assertEqual(self.mechanical.partcount(active=True), 9)
+
+        # Mark one part as inactive and retry
+        part = Part.objects.get(pk=1)
+        part.active = False
+        part.save()
+
         self.assertEqual(self.mechanical.partcount(active=True), 8)
+
         self.assertEqual(self.mechanical.partcount(False), 7)
 
         self.assertEqual(self.electronics.item_count, self.electronics.partcount())
@@ -148,7 +160,7 @@ class CategoryTest(TestCase):
     def test_parameters(self):
         """Test that the Category parameters are correctly fetched."""
         # Check number of SQL queries to iterate other parameters
-        with self.assertNumQueries(8):
+        with self.assertNumQueries(9):
             # Prefetch: 3 queries (parts, parameters and parameters_template)
             fasteners = self.fasteners.prefetch_parts_parameters()
             # Iterate through all parts and parameters
@@ -164,7 +176,7 @@ class CategoryTest(TestCase):
             parts_parameters = self.fasteners.get_parts_parameters(prefetch=fasteners)
             part_infos = ['pk', 'name', 'description']
             for part_parameter in parts_parameters:
-                # Remove part informations
+                # Remove part information
                 for item in part_infos:
                     part_parameter.pop(item)
                 self.assertEqual(len(part_parameter), 1)
@@ -255,8 +267,6 @@ class CategoryTest(TestCase):
         self.assertEqual(ancestors[2], C31)
 
         # At this point, we are confident that the tree is correctly structured
-
-        # Add some parts to category B3
 
         for i in range(10):
             Part.objects.create(

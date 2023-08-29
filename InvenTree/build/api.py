@@ -1,29 +1,41 @@
 """JSON API for the Build app."""
 
-from django.urls import include, re_path
+from django.db.models import F, Q
+from django.urls import include, path, re_path
 from django.utils.translation import gettext_lazy as _
+from django.contrib.auth.models import User
 
-from rest_framework import filters
 from rest_framework.exceptions import ValidationError
 
 from django_filters.rest_framework import DjangoFilterBackend
 from django_filters import rest_framework as rest_filters
 
-from InvenTree.api import AttachmentMixin, APIDownloadMixin, ListCreateDestroyAPIView
+from InvenTree.api import AttachmentMixin, APIDownloadMixin, ListCreateDestroyAPIView, MetadataView
+from generic.states.api import StatusView
 from InvenTree.helpers import str2bool, isNull, DownloadFile
-from InvenTree.filters import InvenTreeOrderingFilter
-from InvenTree.status_codes import BuildStatus
+from InvenTree.status_codes import BuildStatus, BuildStatusGroups
 from InvenTree.mixins import CreateAPI, RetrieveUpdateDestroyAPI, ListCreateAPI
 
+import common.models
 import build.admin
 import build.serializers
-from build.models import Build, BuildItem, BuildOrderAttachment
-
+from build.models import Build, BuildLine, BuildItem, BuildOrderAttachment
+import part.models
 from users.models import Owner
+from InvenTree.filters import SEARCH_ORDER_FILTER_ALIAS
 
 
 class BuildFilter(rest_filters.FilterSet):
     """Custom filterset for BuildList API endpoint."""
+
+    class Meta:
+        """Metaclass options"""
+        model = Build
+        fields = [
+            'parent',
+            'sales_order',
+            'part',
+        ]
 
     status = rest_filters.NumberFilter(label='Status')
 
@@ -32,22 +44,18 @@ class BuildFilter(rest_filters.FilterSet):
     def filter_active(self, queryset, name, value):
         """Filter the queryset to either include or exclude orders which are active."""
         if str2bool(value):
-            queryset = queryset.filter(status__in=BuildStatus.ACTIVE_CODES)
+            return queryset.filter(status__in=BuildStatusGroups.ACTIVE_CODES)
         else:
-            queryset = queryset.exclude(status__in=BuildStatus.ACTIVE_CODES)
-
-        return queryset
+            return queryset.exclude(status__in=BuildStatusGroups.ACTIVE_CODES)
 
     overdue = rest_filters.BooleanFilter(label='Build is overdue', method='filter_overdue')
 
     def filter_overdue(self, queryset, name, value):
         """Filter the queryset to either include or exclude orders which are overdue."""
         if str2bool(value):
-            queryset = queryset.filter(Build.OVERDUE_FILTER)
+            return queryset.filter(Build.OVERDUE_FILTER)
         else:
-            queryset = queryset.exclude(Build.OVERDUE_FILTER)
-
-        return queryset
+            return queryset.exclude(Build.OVERDUE_FILTER)
 
     assigned_to_me = rest_filters.BooleanFilter(label='assigned_to_me', method='filter_assigned_to_me')
 
@@ -59,11 +67,21 @@ class BuildFilter(rest_filters.FilterSet):
         owners = Owner.get_owners_matching_user(self.request.user)
 
         if value:
-            queryset = queryset.filter(responsible__in=owners)
+            return queryset.filter(responsible__in=owners)
         else:
-            queryset = queryset.exclude(responsible__in=owners)
+            return queryset.exclude(responsible__in=owners)
 
-        return queryset
+    assigned_to = rest_filters.NumberFilter(label='responsible', method='filter_responsible')
+
+    def filter_responsible(self, queryset, name, value):
+        """Filter by orders which are assigned to the specified owner."""
+        owners = list(Owner.objects.filter(pk=value))
+
+        # if we query by a user, also find all ownerships through group memberships
+        if len(owners) > 0 and owners[0].label() == 'user':
+            owners = Owner.get_owners_matching_user(User.objects.get(pk=owners[0].owner_id))
+
+        return queryset.filter(responsible__in=owners)
 
     # Exact match for reference
     reference = rest_filters.CharFilter(
@@ -71,6 +89,21 @@ class BuildFilter(rest_filters.FilterSet):
         field_name='reference',
         lookup_expr="iexact"
     )
+
+    project_code = rest_filters.ModelChoiceFilter(
+        queryset=common.models.ProjectCode.objects.all(),
+        field_name='project_code'
+    )
+
+    has_project_code = rest_filters.BooleanFilter(label='has_project_code', method='filter_has_project_code')
+
+    def filter_has_project_code(self, queryset, name, value):
+        """Filter by whether or not the order has a project code"""
+
+        if str2bool(value):
+            return queryset.exclude(project_code=None)
+        else:
+            return queryset.filter(project_code=None)
 
 
 class BuildList(APIDownloadMixin, ListCreateAPI):
@@ -84,11 +117,7 @@ class BuildList(APIDownloadMixin, ListCreateAPI):
     serializer_class = build.serializers.BuildSerializer
     filterset_class = BuildFilter
 
-    filter_backends = [
-        DjangoFilterBackend,
-        filters.SearchFilter,
-        InvenTreeOrderingFilter,
-    ]
+    filter_backends = SEARCH_ORDER_FILTER_ALIAS
 
     ordering_fields = [
         'reference',
@@ -101,10 +130,13 @@ class BuildList(APIDownloadMixin, ListCreateAPI):
         'completed',
         'issued_by',
         'responsible',
+        'project_code',
+        'priority',
     ]
 
     ordering_field_aliases = {
         'reference': ['reference_int', 'reference'],
+        'project_code': ['project_code__code'],
     }
 
     ordering = '-reference'
@@ -115,6 +147,8 @@ class BuildList(APIDownloadMixin, ListCreateAPI):
         'part__name',
         'part__IPN',
         'part__description',
+        'project_code__code',
+        'priority',
     ]
 
     def get_queryset(self):
@@ -155,18 +189,6 @@ class BuildList(APIDownloadMixin, ListCreateAPI):
             except (ValueError, Build.DoesNotExist):
                 pass
 
-        # Filter by "parent"
-        parent = params.get('parent', None)
-
-        if parent is not None:
-            queryset = queryset.filter(parent=parent)
-
-        # Filter by sales_order
-        sales_order = params.get('sales_order', None)
-
-        if sales_order is not None:
-            queryset = queryset.filter(sales_order=sales_order)
-
         # Filter by "ancestor" builds
         ancestor = params.get('ancestor', None)
 
@@ -182,12 +204,6 @@ class BuildList(APIDownloadMixin, ListCreateAPI):
 
             except (ValueError, Build.DoesNotExist):
                 pass
-
-        # Filter by associated part?
-        part = params.get('part', None)
-
-        if part is not None:
-            queryset = queryset.filter(part=part)
 
         # Filter by 'date range'
         min_date = params.get('min_date', None)
@@ -255,6 +271,103 @@ class BuildUnallocate(CreateAPI):
         return ctx
 
 
+class BuildLineFilter(rest_filters.FilterSet):
+    """Custom filterset for the BuildLine API endpoint."""
+
+    class Meta:
+        """Meta information for the BuildLineFilter class."""
+        model = BuildLine
+        fields = [
+            'build',
+            'bom_item',
+        ]
+
+    # Fields on related models
+    consumable = rest_filters.BooleanFilter(label=_('Consumable'), field_name='bom_item__consumable')
+    optional = rest_filters.BooleanFilter(label=_('Optional'), field_name='bom_item__optional')
+    tracked = rest_filters.BooleanFilter(label=_('Tracked'), field_name='bom_item__sub_part__trackable')
+
+    allocated = rest_filters.BooleanFilter(label=_('Allocated'), method='filter_allocated')
+
+    def filter_allocated(self, queryset, name, value):
+        """Filter by whether each BuildLine is fully allocated"""
+
+        if str2bool(value):
+            return queryset.filter(allocated__gte=F('quantity'))
+        else:
+            return queryset.filter(allocated__lt=F('quantity'))
+
+    available = rest_filters.BooleanFilter(label=_('Available'), method='filter_available')
+
+    def filter_available(self, queryset, name, value):
+        """Filter by whether there is sufficient stock available for each BuildLine:
+
+        To determine this, we need to know:
+
+        - The quantity required for each BuildLine
+        - The quantity available for each BuildLine
+        - The quantity allocated for each BuildLine
+        """
+
+        flt = Q(quantity__lte=F('total_available_stock') + F('allocated'))
+
+        if str2bool(value):
+            return queryset.filter(flt)
+        else:
+            return queryset.exclude(flt)
+
+
+class BuildLineEndpoint:
+    """Mixin class for BuildLine API endpoints."""
+
+    queryset = BuildLine.objects.all()
+    serializer_class = build.serializers.BuildLineSerializer
+
+    def get_queryset(self):
+        """Override queryset to select-related and annotate"""
+        queryset = super().get_queryset()
+
+        queryset = build.serializers.BuildLineSerializer.annotate_queryset(queryset)
+
+        return queryset
+
+
+class BuildLineList(BuildLineEndpoint, ListCreateAPI):
+    """API endpoint for accessing a list of BuildLine objects"""
+
+    filterset_class = BuildLineFilter
+    filter_backends = SEARCH_ORDER_FILTER_ALIAS
+
+    ordering_fields = [
+        'part',
+        'allocated',
+        'reference',
+        'quantity',
+        'consumable',
+        'optional',
+        'unit_quantity',
+        'available_stock',
+    ]
+
+    ordering_field_aliases = {
+        'part': 'bom_item__sub_part__name',
+        'reference': 'bom_item__reference',
+        'unit_quantity': 'bom_item__quantity',
+        'consumable': 'bom_item__consumable',
+        'optional': 'bom_item__optional',
+    }
+
+    search_fields = [
+        'bom_item__sub_part__name',
+        'bom_item__reference',
+    ]
+
+
+class BuildLineDetail(BuildLineEndpoint, RetrieveUpdateDestroyAPI):
+    """API endpoint for detail view of a BuildLine object."""
+    pass
+
+
 class BuildOrderContextMixin:
     """Mixin class which adds build order as serializer context variable."""
 
@@ -279,6 +392,19 @@ class BuildOutputCreate(BuildOrderContextMixin, CreateAPI):
     queryset = Build.objects.none()
 
     serializer_class = build.serializers.BuildOutputCreateSerializer
+
+
+class BuildOutputScrap(BuildOrderContextMixin, CreateAPI):
+    """API endpoint for scrapping build output(s)."""
+
+    queryset = Build.objects.none()
+    serializer_class = build.serializers.BuildOutputScrapSerializer
+
+    def get_serializer_context(self):
+        """Add extra context information to the endpoint serializer."""
+        ctx = super().get_serializer_context()
+        ctx['to_complete'] = False
+        return ctx
 
 
 class BuildOutputComplete(BuildOrderContextMixin, CreateAPI):
@@ -357,6 +483,38 @@ class BuildItemDetail(RetrieveUpdateDestroyAPI):
     serializer_class = build.serializers.BuildItemSerializer
 
 
+class BuildItemFilter(rest_filters.FilterSet):
+    """Custom filterset for the BuildItemList API endpoint"""
+
+    class Meta:
+        """Metaclass option"""
+        model = BuildItem
+        fields = [
+            'build_line',
+            'stock_item',
+            'install_into',
+        ]
+
+    part = rest_filters.ModelChoiceFilter(
+        queryset=part.models.Part.objects.all(),
+        field_name='stock_item__part',
+    )
+
+    build = rest_filters.ModelChoiceFilter(
+        queryset=build.models.Build.objects.all(),
+        field_name='build_line__build',
+    )
+
+    tracked = rest_filters.BooleanFilter(label='Tracked', method='filter_tracked')
+
+    def filter_tracked(self, queryset, name, value):
+        """Filter the queryset based on whether build items are tracked"""
+        if str2bool(value):
+            return queryset.exclude(install_into=None)
+        else:
+            return queryset.filter(install_into=None)
+
+
 class BuildItemList(ListCreateAPI):
     """API endpoint for accessing a list of BuildItem objects.
 
@@ -365,16 +523,16 @@ class BuildItemList(ListCreateAPI):
     """
 
     serializer_class = build.serializers.BuildItemSerializer
+    filterset_class = BuildItemFilter
 
     def get_serializer(self, *args, **kwargs):
         """Returns a BuildItemSerializer instance based on the request."""
         try:
             params = self.request.query_params
 
-            kwargs['part_detail'] = str2bool(params.get('part_detail', False))
-            kwargs['build_detail'] = str2bool(params.get('build_detail', False))
-            kwargs['location_detail'] = str2bool(params.get('location_detail', False))
-            kwargs['stock_detail'] = str2bool(params.get('stock_detail', True))
+            for key in ['part_detail', 'location_detail', 'stock_detail', 'build_detail']:
+                if key in params:
+                    kwargs[key] = str2bool(params.get(key, False))
         except AttributeError:
             pass
 
@@ -385,9 +543,8 @@ class BuildItemList(ListCreateAPI):
         queryset = BuildItem.objects.all()
 
         queryset = queryset.select_related(
-            'bom_item',
-            'bom_item__sub_part',
-            'build',
+            'build_line',
+            'build_line__build',
             'install_into',
             'stock_item',
             'stock_item__location',
@@ -397,28 +554,10 @@ class BuildItemList(ListCreateAPI):
         return queryset
 
     def filter_queryset(self, queryset):
-        """Customm query filtering for the BuildItem list."""
+        """Custom query filtering for the BuildItem list."""
         queryset = super().filter_queryset(queryset)
 
         params = self.request.query_params
-
-        # Does the user wish to filter by part?
-        part_pk = params.get('part', None)
-
-        if part_pk:
-            queryset = queryset.filter(stock_item__part=part_pk)
-
-        # Filter by "tracked" status
-        # Tracked means that the item is "installed" into a build output (stock item)
-        tracked = params.get('tracked', None)
-
-        if tracked is not None:
-            tracked = str2bool(tracked)
-
-            if tracked:
-                queryset = queryset.exclude(install_into=None)
-            else:
-                queryset = queryset.filter(install_into=None)
 
         # Filter by output target
         output = params.get('output', None)
@@ -434,13 +573,6 @@ class BuildItemList(ListCreateAPI):
 
     filter_backends = [
         DjangoFilterBackend,
-    ]
-
-    filterset_fields = [
-        'build',
-        'stock_item',
-        'bom_item',
-        'install_into',
     ]
 
 
@@ -470,28 +602,42 @@ build_api_urls = [
 
     # Attachments
     re_path(r'^attachment/', include([
-        re_path(r'^(?P<pk>\d+)/', BuildAttachmentDetail.as_view(), name='api-build-attachment-detail'),
+        path(r'<int:pk>/', BuildAttachmentDetail.as_view(), name='api-build-attachment-detail'),
         re_path(r'^.*$', BuildAttachmentList.as_view(), name='api-build-attachment-list'),
+    ])),
+
+    # Build lines
+    re_path(r'^line/', include([
+        path(r'<int:pk>/', BuildLineDetail.as_view(), name='api-build-line-detail'),
+        re_path(r'^.*$', BuildLineList.as_view(), name='api-build-line-list'),
     ])),
 
     # Build Items
     re_path(r'^item/', include([
-        re_path(r'^(?P<pk>\d+)/', BuildItemDetail.as_view(), name='api-build-item-detail'),
+        path(r'<int:pk>/', include([
+            re_path(r'^metadata/', MetadataView.as_view(), {'model': BuildItem}, name='api-build-item-metadata'),
+            re_path(r'^.*$', BuildItemDetail.as_view(), name='api-build-item-detail'),
+        ])),
         re_path(r'^.*$', BuildItemList.as_view(), name='api-build-item-list'),
     ])),
 
     # Build Detail
-    re_path(r'^(?P<pk>\d+)/', include([
+    path(r'<int:pk>/', include([
         re_path(r'^allocate/', BuildAllocate.as_view(), name='api-build-allocate'),
         re_path(r'^auto-allocate/', BuildAutoAllocate.as_view(), name='api-build-auto-allocate'),
         re_path(r'^complete/', BuildOutputComplete.as_view(), name='api-build-output-complete'),
         re_path(r'^create-output/', BuildOutputCreate.as_view(), name='api-build-output-create'),
         re_path(r'^delete-outputs/', BuildOutputDelete.as_view(), name='api-build-output-delete'),
+        re_path(r'^scrap-outputs/', BuildOutputScrap.as_view(), name='api-build-output-scrap'),
         re_path(r'^finish/', BuildFinish.as_view(), name='api-build-finish'),
         re_path(r'^cancel/', BuildCancel.as_view(), name='api-build-cancel'),
         re_path(r'^unallocate/', BuildUnallocate.as_view(), name='api-build-unallocate'),
+        re_path(r'^metadata/', MetadataView.as_view(), {'model': Build}, name='api-build-metadata'),
         re_path(r'^.*$', BuildDetail.as_view(), name='api-build-detail'),
     ])),
+
+    # Build order status code information
+    re_path(r'status/', StatusView.as_view(), {StatusView.MODEL_REF: BuildStatus}, name='api-build-status-codes'),
 
     # Build List
     re_path(r'^.*$', BuildList.as_view(), name='api-build-list'),

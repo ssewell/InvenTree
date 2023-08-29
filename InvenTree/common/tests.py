@@ -1,22 +1,30 @@
 """Tests for mechanisms in common."""
 
+import io
 import json
+import time
 from datetime import timedelta
 from http import HTTPStatus
+from unittest import mock
 
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import Client, TestCase
 from django.urls import reverse
 
-from InvenTree.api_tester import InvenTreeAPITestCase, PluginMixin
-from InvenTree.helpers import InvenTreeTestCase, str2bool
+import PIL
+
+from InvenTree.helpers import str2bool
+from InvenTree.unit_test import (InvenTreeAPITestCase, InvenTreeTestCase,
+                                 PluginMixin)
 from plugin import registry
 from plugin.models import NotificationUserSetting
 
 from .api import WebhookView
-from .models import (ColorTheme, InvenTreeSetting, InvenTreeUserSetting,
-                     NotificationEntry, NotificationMessage, WebhookEndpoint,
+from .models import (ColorTheme, CustomUnit, InvenTreeSetting,
+                     InvenTreeUserSetting, NotesImage, NotificationEntry,
+                     NotificationMessage, ProjectCode, WebhookEndpoint,
                      WebhookMessage)
 
 CONTENT_TYPE_JSON = 'application/json'
@@ -99,6 +107,40 @@ class SettingsTest(InvenTreeTestCase):
         self.assertIn('PART_COPY_TESTS', result)
         self.assertIn('STOCK_OWNERSHIP_CONTROL', result)
         self.assertIn('SIGNUP_GROUP', result)
+        self.assertIn('SERVER_RESTART_REQUIRED', result)
+
+        result = InvenTreeSetting.allValues(exclude_hidden=True)
+        self.assertNotIn('SERVER_RESTART_REQUIRED', result)
+
+    def test_all_settings(self):
+        """Make sure that the all_settings function returns correctly"""
+        result = InvenTreeSetting.all_settings()
+        self.assertIn("INVENTREE_INSTANCE", result)
+        self.assertIsInstance(result['INVENTREE_INSTANCE'], InvenTreeSetting)
+
+    @mock.patch("common.models.InvenTreeSetting.get_setting_definition")
+    def test_check_all_settings(self, get_setting_definition):
+        """Make sure that the check_all_settings function returns correctly"""
+        # define partial schema
+        settings_definition = {
+            "AB": {  # key that's has not already been accessed
+                "required": True,
+            },
+            "CD": {
+                "required": True,
+                "protected": True,
+            },
+            "EF": {}
+        }
+
+        def mocked(key, **kwargs):
+            return settings_definition.get(key, {})
+        get_setting_definition.side_effect = mocked
+
+        self.assertEqual(InvenTreeSetting.check_all_settings(settings_definition=settings_definition), (False, ["AB", "CD"]))
+        InvenTreeSetting.set_setting('AB', "hello", self.user)
+        InvenTreeSetting.set_setting('CD', "world", self.user)
+        self.assertEqual(InvenTreeSetting.check_all_settings(), (True, []))
 
     def run_settings_check(self, key, setting):
         """Test that all settings are valid.
@@ -134,6 +176,7 @@ class SettingsTest(InvenTreeTestCase):
             'units',
             'requires_restart',
             'after_save',
+            'before_save',
         ]
 
         for k in setting.keys():
@@ -219,7 +262,7 @@ class SettingsTest(InvenTreeTestCase):
 
         cache.clear()
 
-        # Generate a number of new usesr
+        # Generate a number of new users
         for idx in range(5):
             get_user_model().objects.create(
                 username=f"User_{idx}",
@@ -265,7 +308,7 @@ class GlobalSettingsApiTest(InvenTreeAPITestCase):
         self.assertEqual(len(response.data), len(InvenTreeSetting.SETTINGS.keys()))
 
     def test_company_name(self):
-        """Test a settings object lifecyle e2e."""
+        """Test a settings object lifecycle e2e."""
         setting = InvenTreeSetting.get_setting_object('INVENTREE_COMPANY_NAME')
 
         # Check default value
@@ -410,7 +453,7 @@ class UserSettingsApiTest(InvenTreeAPITestCase):
 
             self.assertTrue(str2bool(response.data['value']))
 
-        # Assign some falsey values
+        # Assign some false(ish) values
         for v in ['false', False, '0', 'n', 'FalSe']:
             self.patch(
                 url,
@@ -528,7 +571,7 @@ class NotificationUserSettingsApiTest(InvenTreeAPITestCase):
 
     def test_api_list(self):
         """Test list URL."""
-        url = reverse('api-notifcation-setting-list')
+        url = reverse('api-notification-setting-list')
 
         self.get(url, expected_code=200)
 
@@ -576,7 +619,7 @@ class PluginSettingsApiTest(PluginMixin, InvenTreeAPITestCase):
 
         # Failure mode tests
 
-        # Non - exsistant plugin
+        # Non-existent plugin
         url = reverse('api-plugin-setting-detail', kwargs={'plugin': 'doesnotexist', 'key': 'doesnotmatter'})
         response = self.get(url, expected_code=404)
         self.assertIn("Plugin 'doesnotexist' not installed", str(response.data))
@@ -722,7 +765,7 @@ class WebhookMessageTests(TestCase):
 
 
 class NotificationTest(InvenTreeAPITestCase):
-    """Tests for NotificationEntriy."""
+    """Tests for NotificationEntry."""
 
     fixtures = [
         'users',
@@ -774,11 +817,11 @@ class NotificationTest(InvenTreeAPITestCase):
         for _ii in range(10):
             Error.objects.create()
 
-        # Check that messsages have been created
+        # Check that messages have been created
         messages = NotificationMessage.objects.all()
 
         # As there are three staff users (including the 'test' user) we expect 30 notifications
-        # However, one user is marked as i nactive
+        # However, one user is marked as inactive
         self.assertEqual(messages.count(), 20)
 
         # Only 10 messages related to *this* user
@@ -827,7 +870,7 @@ class NotificationTest(InvenTreeAPITestCase):
         self.assertEqual(NotificationMessage.objects.filter(user=self.user).count(), 3)
 
 
-class LoadingTest(TestCase):
+class CommonTest(InvenTreeAPITestCase):
     """Tests for the common config."""
 
     def test_restart_flag(self):
@@ -836,13 +879,74 @@ class LoadingTest(TestCase):
         from plugin import registry
 
         # set flag true
-        common.models.InvenTreeSetting.set_setting('SERVER_RESTART_REQUIRED', False, None)
+        common.models.InvenTreeSetting.set_setting('SERVER_RESTART_REQUIRED', True, None)
 
         # reload the app
         registry.reload_plugins()
 
         # now it should be false again
         self.assertFalse(common.models.InvenTreeSetting.get_setting('SERVER_RESTART_REQUIRED'))
+
+    def test_config_api(self):
+        """Test config URLs."""
+        # Not superuser
+        self.get(reverse('api-config-list'), expected_code=403)
+
+        # Turn into superuser
+        self.user.is_superuser = True
+        self.user.save()
+
+        # Successful checks
+        data = [
+            self.get(reverse('api-config-list'), expected_code=200).data[0],                                    # list endpoint
+            self.get(reverse('api-config-detail', kwargs={'key': 'INVENTREE_DEBUG'}), expected_code=200).data,  # detail endpoint
+        ]
+
+        for item in data:
+            self.assertEqual(item['key'], 'INVENTREE_DEBUG')
+            self.assertEqual(item['env_var'], 'INVENTREE_DEBUG')
+            self.assertEqual(item['config_key'], 'debug')
+
+        # Turn into normal user again
+        self.user.is_superuser = False
+        self.user.save()
+
+    def test_flag_api(self):
+        """Test flag URLs."""
+        # Not superuser
+        response = self.get(reverse('api-flag-list'), expected_code=200)
+        self.assertEqual(len(response.data), 2)
+        self.assertEqual(response.data[0]['key'], 'EXPERIMENTAL')
+
+        # Turn into superuser
+        self.user.is_superuser = True
+        self.user.save()
+
+        # Successful checks
+        response = self.get(reverse('api-flag-list'), expected_code=200)
+        self.assertEqual(len(response.data), 2)
+        self.assertEqual(response.data[0]['key'], 'EXPERIMENTAL')
+        self.assertTrue(response.data[0]['conditions'])
+
+        response = self.get(reverse('api-flag-detail', kwargs={'key': 'EXPERIMENTAL'}), expected_code=200)
+        self.assertEqual(len(response.data), 3)
+        self.assertEqual(response.data['key'], 'EXPERIMENTAL')
+        self.assertTrue(response.data['conditions'])
+
+        # Try without param -> false
+        response = self.get(reverse('api-flag-detail', kwargs={'key': 'NEXT_GEN'}), expected_code=200)
+        self.assertFalse(response.data['state'])
+
+        # Try with param -> true
+        response = self.get(reverse('api-flag-detail', kwargs={'key': 'NEXT_GEN'}), {'ngen': ''}, expected_code=200)
+        self.assertTrue(response.data['state'])
+
+        # Try non existent flag
+        response = self.get(reverse('api-flag-detail', kwargs={'key': 'NON_EXISTENT'}), expected_code=404)
+
+        # Turn into normal user again
+        self.user.is_superuser = False
+        self.user.save()
 
 
 class ColorThemeTest(TestCase):
@@ -875,3 +979,294 @@ class ColorThemeTest(TestCase):
         # check valid theme
         self.assertFalse(ColorTheme.is_valid_choice(aa))
         self.assertTrue(ColorTheme.is_valid_choice(ab))
+
+
+class CurrencyAPITests(InvenTreeAPITestCase):
+    """Unit tests for the currency exchange API endpoints"""
+
+    def test_exchange_endpoint(self):
+        """Test that the currency exchange endpoint works as expected"""
+
+        response = self.get(reverse('api-currency-exchange'), expected_code=200)
+
+        self.assertIn('base_currency', response.data)
+        self.assertIn('exchange_rates', response.data)
+
+    def test_refresh_endpoint(self):
+        """Call the 'refresh currencies' endpoint"""
+
+        from djmoney.contrib.exchange.models import Rate
+
+        # Delete any existing exchange rate data
+        Rate.objects.all().delete()
+
+        # Updating via the external exchange may not work every time
+        for _idx in range(5):
+            self.post(reverse('api-currency-refresh'))
+
+            # There should be some new exchange rate objects now
+            if Rate.objects.all().exists():
+                # Exit early
+                return
+
+            # Delay and try again
+            time.sleep(10)
+
+        raise TimeoutError("Could not refresh currency exchange data after 5 attempts")
+
+
+class NotesImageTest(InvenTreeAPITestCase):
+    """Tests for uploading images to be used in markdown notes."""
+
+    def test_invalid_files(self):
+        """Test that invalid files are rejected."""
+
+        n = NotesImage.objects.count()
+
+        # Test upload of a simple text file
+        response = self.post(
+            reverse('api-notes-image-list'),
+            data={
+                'image': SimpleUploadedFile('test.txt', b"this is not an image file", content_type='text/plain'),
+            },
+            format='multipart',
+            expected_code=400
+        )
+
+        self.assertIn("Upload a valid image", str(response.data['image']))
+
+        # Test upload of an invalid image file
+        response = self.post(
+            reverse('api-notes-image-list'),
+            data={
+                'image': SimpleUploadedFile('test.png', b"this is not an image file", content_type='image/png'),
+            },
+            format='multipart',
+            expected_code=400,
+        )
+
+        self.assertIn("Upload a valid image", str(response.data['image']))
+
+        # Check that no extra database entries have been created
+        self.assertEqual(NotesImage.objects.count(), n)
+
+    def test_valid_image(self):
+        """Test upload of a valid image file"""
+
+        n = NotesImage.objects.count()
+
+        # Construct a simple image file
+        image = PIL.Image.new('RGB', (100, 100), color='red')
+
+        with io.BytesIO() as output:
+            image.save(output, format='PNG')
+            contents = output.getvalue()
+
+        self.post(
+            reverse('api-notes-image-list'),
+            data={
+                'image': SimpleUploadedFile('test.png', contents, content_type='image/png'),
+            },
+            format='multipart',
+            expected_code=201
+        )
+
+        # Check that a new file has been created
+        self.assertEqual(NotesImage.objects.count(), n + 1)
+
+
+class ProjectCodesTest(InvenTreeAPITestCase):
+    """Units tests for the ProjectCodes model and API endpoints"""
+
+    @property
+    def url(self):
+        """Return the URL for the project code list endpoint"""
+        return reverse('api-project-code-list')
+
+    @classmethod
+    def setUpTestData(cls):
+        """Create some initial project codes"""
+        super().setUpTestData()
+
+        codes = [
+            ProjectCode(code='PRJ-001', description='Test project code'),
+            ProjectCode(code='PRJ-002', description='Test project code'),
+            ProjectCode(code='PRJ-003', description='Test project code'),
+            ProjectCode(code='PRJ-004', description='Test project code'),
+        ]
+
+        ProjectCode.objects.bulk_create(codes)
+
+    def test_list(self):
+        """Test that the list endpoint works as expected"""
+
+        response = self.get(self.url, expected_code=200)
+        self.assertEqual(len(response.data), ProjectCode.objects.count())
+
+    def test_delete(self):
+        """Test we can delete a project code via the API"""
+
+        n = ProjectCode.objects.count()
+
+        # Get the first project code
+        code = ProjectCode.objects.first()
+
+        # Delete it
+        self.delete(
+            reverse('api-project-code-detail', kwargs={'pk': code.pk}),
+            expected_code=204
+        )
+
+        # Check it is gone
+        self.assertEqual(ProjectCode.objects.count(), n - 1)
+
+    def test_duplicate_code(self):
+        """Test that we cannot create two project codes with the same code"""
+
+        # Create a new project code
+        response = self.post(
+            self.url,
+            data={
+                'code': 'PRJ-001',
+                'description': 'Test project code',
+            },
+            expected_code=400
+        )
+
+        self.assertIn('project code with this Project Code already exists', str(response.data['code']))
+
+    def test_write_access(self):
+        """Test that non-staff users have read-only access"""
+
+        # By default user has staff access, can create a new project code
+        response = self.post(
+            self.url,
+            data={
+                'code': 'PRJ-xxx',
+                'description': 'Test project code',
+            },
+            expected_code=201
+        )
+
+        pk = response.data['pk']
+
+        # Test we can edit, also
+        response = self.patch(
+            reverse('api-project-code-detail', kwargs={'pk': pk}),
+            data={
+                'code': 'PRJ-999',
+            },
+            expected_code=200
+        )
+
+        self.assertEqual(response.data['code'], 'PRJ-999')
+
+        # Restrict user access to non-staff
+        self.user.is_staff = False
+        self.user.save()
+
+        # As user does not have staff access, should return 403 for list endpoint
+        response = self.post(
+            self.url,
+            data={
+                'code': 'PRJ-123',
+                'description': 'Test project code'
+            },
+            expected_code=403
+        )
+
+        # Should also return 403 for detail endpoint
+        response = self.patch(
+            reverse('api-project-code-detail', kwargs={'pk': pk}),
+            data={
+                'code': 'PRJ-999',
+            },
+            expected_code=403
+        )
+
+
+class CustomUnitAPITest(InvenTreeAPITestCase):
+    """Unit tests for the CustomUnit API"""
+
+    @property
+    def url(self):
+        """Return the API endpoint for the CustomUnit list"""
+        return reverse('api-custom-unit-list')
+
+    @classmethod
+    def setUpTestData(cls):
+        """Construct some initial test fixture data"""
+        super().setUpTestData()
+
+        units = [
+            CustomUnit(name='metres_per_amp', definition='meter / ampere', symbol='m/A'),
+            CustomUnit(name='hectares_per_second', definition='hectares per second', symbol='ha/s'),
+        ]
+
+        CustomUnit.objects.bulk_create(units)
+
+    def test_list(self):
+        """Test API list functionality"""
+
+        response = self.get(self.url, expected_code=200)
+        self.assertEqual(len(response.data), CustomUnit.objects.count())
+
+    def test_edit(self):
+        """Test edit permissions for CustomUnit model"""
+
+        unit = CustomUnit.objects.first()
+
+        # Try to edit without permission
+        self.user.is_staff = False
+        self.user.save()
+
+        self.patch(
+            reverse('api-custom-unit-detail', kwargs={'pk': unit.pk}),
+            {
+                'name': 'new_unit_name',
+            },
+            expected_code=403
+        )
+
+        # Ok, what if we have permission?
+        self.user.is_staff = True
+        self.user.save()
+
+        self.patch(
+            reverse('api-custom-unit-detail', kwargs={'pk': unit.pk}),
+            {
+                'name': 'new_unit_name',
+            },
+            # expected_code=200
+        )
+
+        unit.refresh_from_db()
+        self.assertEqual(unit.name, 'new_unit_name')
+
+    def test_validation(self):
+        """Test that validation works as expected"""
+
+        unit = CustomUnit.objects.first()
+
+        self.user.is_staff = True
+        self.user.save()
+
+        # Test invalid 'name' values (must be valid identifier)
+        invalid_name_values = [
+            '1',
+            '1abc',
+            'abc def',
+            'abc-def',
+            'abc.def',
+        ]
+
+        url = reverse('api-custom-unit-detail', kwargs={'pk': unit.pk})
+
+        for name in invalid_name_values:
+            self.patch(
+                url,
+                {
+                    'name': name,
+                },
+                expected_code=400
+            )

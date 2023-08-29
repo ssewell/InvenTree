@@ -4,9 +4,6 @@ In particular these views provide base functionality for rendering Django forms
 as JSON objects and passing them to modal forms (using jQuery / bootstrap).
 """
 
-import json
-
-from django.conf import settings
 from django.contrib.auth import password_validation
 from django.contrib.auth.mixins import (LoginRequiredMixin,
                                         PermissionRequiredMixin)
@@ -27,12 +24,11 @@ from allauth.account.views import (EmailView, LoginView,
                                    PasswordResetFromKeyView)
 from allauth.socialaccount.forms import DisconnectForm
 from allauth.socialaccount.views import ConnectionsView
-from allauth_2fa.views import TwoFactorRemove
 from djmoney.contrib.exchange.models import ExchangeBackend, Rate
 from user_sessions.views import SessionDeleteOtherView, SessionDeleteView
 
-from common.models import ColorTheme, InvenTreeSetting
-from common.settings import currency_code_default, currency_codes
+import common.models as common_models
+import common.settings as common_settings
 from part.models import PartCategory
 from users.models import RuleSet, check_user_role
 
@@ -320,44 +316,6 @@ class AjaxView(AjaxMixin, View):
         return self.renderJsonResponse(request)
 
 
-class QRCodeView(AjaxView):
-    """An 'AJAXified' view for displaying a QR code.
-
-    Subclasses should implement the get_qr_data(self) function.
-    """
-
-    ajax_template_name = "qr_code.html"
-
-    def get(self, request, *args, **kwargs):
-        """Return json with qr-code data."""
-        self.request = request
-        self.pk = self.kwargs['pk']
-        return self.renderJsonResponse(request, None, context=self.get_context_data())
-
-    def get_qr_data(self):
-        """Returns the text object to render to a QR code.
-
-        The actual rendering will be handled by the template
-        """
-        return None
-
-    def get_context_data(self):
-        """Get context data for passing to the rendering template.
-
-        Explicity passes the parameter 'qr_data'
-        """
-        context = {}
-
-        qr = self.get_qr_data()
-
-        if qr:
-            context['qr_data'] = qr
-        else:
-            context['error_msg'] = 'Error generating QR code'
-
-        return context
-
-
 class AjaxUpdateView(AjaxMixin, UpdateView):
     """An 'AJAXified' UpdateView for updating an object in the db.
 
@@ -395,7 +353,7 @@ class AjaxUpdateView(AjaxMixin, UpdateView):
         - Updates model with POST field data
         - Performs form and object validation
         - If errors exist, re-render the form
-        - Otherwise, return sucess status
+        - Otherwise, return success status
         """
         self.request = request
 
@@ -424,7 +382,7 @@ class AjaxUpdateView(AjaxMixin, UpdateView):
 
         if valid:
 
-            # Save the updated objec to the database
+            # Save the updated object to the database
             self.save(self.object, form)
 
             self.object = self.get_object()
@@ -552,10 +510,10 @@ class SettingsView(TemplateView):
         """Add data for template."""
         ctx = super().get_context_data(**kwargs).copy()
 
-        ctx['settings'] = InvenTreeSetting.objects.all().order_by('key')
+        ctx['settings'] = common_models.InvenTreeSetting.objects.all().order_by('key')
 
-        ctx["base_currency"] = currency_code_default()
-        ctx["currencies"] = currency_codes
+        ctx["base_currency"] = common_settings.currency_code_default()
+        ctx["currencies"] = common_settings.currency_codes
 
         ctx["rates"] = Rate.objects.filter(backend="InvenTreeExchange")
 
@@ -563,18 +521,12 @@ class SettingsView(TemplateView):
 
         # When were the rates last updated?
         try:
-            backend = ExchangeBackend.objects.get(name='InvenTreeExchange')
-            ctx["rates_updated"] = backend.last_update
+            backend = ExchangeBackend.objects.filter(name='InvenTreeExchange')
+            if backend.exists():
+                backend = backend.first()
+                ctx["rates_updated"] = backend.last_update
         except Exception:
             ctx["rates_updated"] = None
-
-        # load locale stats
-        STAT_FILE = settings.BASE_DIR.joinpath('InvenTree/locale_stats.json').absolute()
-
-        try:
-            ctx["locale_stats"] = json.load(open(STAT_FILE, 'r'))
-        except Exception:
-            ctx["locale_stats"] = {}
 
         # Forms and context for allauth
         ctx['add_email_form'] = AddEmailForm
@@ -652,28 +604,14 @@ class CustomLoginView(LoginView):
         return super().get(request, *args, **kwargs)
 
 
-class CurrencyRefreshView(RedirectView):
-    """POST endpoint to refresh / update exchange rates."""
-
-    url = reverse_lazy("settings-currencies")
-
-    def post(self, request, *args, **kwargs):
-        """On a POST request we will attempt to refresh the exchange rates."""
-        from InvenTree.tasks import offload_task, update_exchange_rates
-
-        offload_task(update_exchange_rates, force_sync=True)
-
-        return redirect(reverse_lazy('settings'))
-
-
 class AppearanceSelectView(RedirectView):
     """View for selecting a color theme."""
 
     def get_user_theme(self):
         """Get current user color theme."""
         try:
-            user_theme = ColorTheme.objects.filter(user=self.request.user).get()
-        except ColorTheme.DoesNotExist:
+            user_theme = common_models.ColorTheme.objects.filter(user=self.request.user).get()
+        except common_models.ColorTheme.DoesNotExist:
             user_theme = None
 
         return user_theme
@@ -687,11 +625,15 @@ class AppearanceSelectView(RedirectView):
 
         # Create theme entry if user did not select one yet
         if not user_theme:
-            user_theme = ColorTheme()
+            user_theme = common_models.ColorTheme()
             user_theme.user = request.user
 
-        user_theme.name = theme
-        user_theme.save()
+        if theme:
+            try:
+                user_theme.name = theme
+                user_theme.save()
+            except Exception:
+                pass
 
         return redirect(reverse_lazy('settings'))
 
@@ -714,9 +656,3 @@ class NotificationsView(TemplateView):
     """View for showing notifications."""
 
     template_name = "InvenTree/notifications/notifications.html"
-
-
-# Custom 2FA removal form to allow custom redirect URL
-class CustomTwoFactorRemove(TwoFactorRemove):
-    """Specify custom URL redirect."""
-    success_url = reverse_lazy("settings")

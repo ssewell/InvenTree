@@ -1,5 +1,6 @@
 {% load i18n %}
-
+{% load static %}
+{% load inventree_extras %}
 /* globals
     attachSelect,
     closeModal,
@@ -8,249 +9,46 @@
     modalEnable,
     modalSetContent,
     modalSetTitle,
+    modalShowSubmitButton,
     modalSubmit,
     openModal,
-    plugins_enabled,
     showAlertDialog,
+    showMessage,
+    user_settings,
 */
 
 /* exported
     printLabels,
-    printPartLabels,
-    printStockItemLabels,
-    printStockLocationLabels,
 */
 
-
-/*
- * Perform the "print" action.
+/**
+ * Present the user with the available labels,
+ * and allow them to select which label to print.
+ *
+ * The intent is that the available labels have been requested
+ * (via AJAX) from the server.
  */
-function printLabels(url, plugin=null) {
-
-    if (plugin) {
-        // If a plugin is provided, do not redirect the browser.
-        // Instead, perform an API request and display a message
-
-        url = url + `plugin=${plugin}`;
-
-        inventreeGet(url, {}, {
-            success: function(response) {
-                showMessage(
-                    '{% trans "Labels sent to printer" %}',
-                    {
-                        style: 'success',
-                    }
-                );
-            }
-        });
-    } else {
-        window.open(url);
-    }
-
-}
-
-
-function printStockItemLabels(items) {
-    /**
-     * Print stock item labels for the given stock items
-     */
-
-    if (items.length == 0) {
-        showAlertDialog(
-            '{% trans "Select Stock Items" %}',
-            '{% trans "Stock item(s) must be selected before printing labels" %}'
-        );
-
-        return;
-    }
-
-    // Request available labels from the server
-    inventreeGet(
-        '{% url "api-stockitem-label-list" %}',
-        {
-            enabled: true,
-            items: items,
-        },
-        {
-            success: function(response) {
-
-                if (response.length == 0) {
-                    showAlertDialog(
-                        '{% trans "No Labels Found" %}',
-                        '{% trans "No labels found which match selected stock item(s)" %}',
-                    );
-
-                    return;
-                }
-
-                // Select label to print
-                selectLabel(
-                    response,
-                    items,
-                    {
-                        success: function(data) {
-
-                            var pk = data.label;
-
-                            var href = `/api/label/stock/${pk}/print/?`;
-
-                            items.forEach(function(item) {
-                                href += `items[]=${item}&`;
-                            });
-
-                            printLabels(href, data.plugin);
-                        }
-                    }
-                );
-            }
-        }
-    );
-}
-
-
-function printStockLocationLabels(locations) {
-
-    if (locations.length == 0) {
-        showAlertDialog(
-            '{% trans "Select Stock Locations" %}',
-            '{% trans "Stock location(s) must be selected before printing labels" %}'
-        );
-
-        return;
-    }
-
-    // Request available labels from the server
-    inventreeGet(
-        '{% url "api-stocklocation-label-list" %}',
-        {
-            enabled: true,
-            locations: locations,
-        },
-        {
-            success: function(response) {
-                if (response.length == 0) {
-                    showAlertDialog(
-                        '{% trans "No Labels Found" %}',
-                        '{% trans "No labels found which match selected stock location(s)" %}',
-                    );
-
-                    return;
-                }
-
-                // Select label to print
-                selectLabel(
-                    response,
-                    locations,
-                    {
-                        success: function(data) {
-
-                            var pk = data.label;
-
-                            var href = `/api/label/location/${pk}/print/?`;
-
-                            locations.forEach(function(location) {
-                                href += `locations[]=${location}&`;
-                            });
-
-                            printLabels(href, data.plugin);
-                        }
-                    }
-                );
-            }
-        }
-    );
-}
-
-
-function printPartLabels(parts) {
-    /**
-     * Print labels for the provided parts
-     */
-
-    if (parts.length == 0) {
-        showAlertDialog(
-            '{% trans "Select Parts" %}',
-            '{% trans "Part(s) must be selected before printing labels" %}',
-        );
-
-        return;
-    }
-
-    // Request available labels from the server
-    inventreeGet(
-        '{% url "api-part-label-list" %}',
-        {
-            enabled: true,
-            parts: parts,
-        },
-        {
-            success: function(response) {
-
-                if (response.length == 0) {
-                    showAlertDialog(
-                        '{% trans "No Labels Found" %}',
-                        '{% trans "No labels found which match the selected part(s)" %}',
-                    );
-
-                    return;
-                }
-
-                // Select label to print
-                selectLabel(
-                    response,
-                    parts,
-                    {
-                        success: function(data) {
-
-                            var pk = data.label;
-
-                            var href = `/api/label/part/${pk}/print/?`;
-
-                            parts.forEach(function(part) {
-                                href += `parts[]=${part}&`;
-                            });
-
-                            printLabels(href, data.plugin);
-                        }
-                    }
-                );
-            }
-        }
-    );
-}
-
-
 function selectLabel(labels, items, options={}) {
-    /**
-     * Present the user with the available labels,
-     * and allow them to select which label to print.
-     *
-     * The intent is that the available labels have been requested
-     * (via AJAX) from the server.
-     */
-
     // Array of available plugins for label printing
     var plugins = [];
 
     // Request a list of available label printing plugins from the server
-    if (plugins_enabled) {
-        inventreeGet(
-            `/api/plugin/`,
-            {
-                mixin: 'labels',
-            },
-            {
-                async: false,
-                success: function(response) {
-                    plugins = response;
-                }
+    inventreeGet(
+        `/api/plugins/`,
+        {
+            mixin: 'labels',
+        },
+        {
+            async: false,
+            success: function(response) {
+                plugins = response;
             }
-        );
-    }
+        }
+    );
 
     var plugin_selection = '';
 
-    if (plugins_enabled && plugins.length > 0) {
+    if (plugins.length > 0) {
         plugin_selection =`
         <div class='form-group'>
             <label class='control-label requiredField' for='id_plugin'>
@@ -258,11 +56,14 @@ function selectLabel(labels, items, options={}) {
             </label>
             <div class='controls'>
                 <select id='id_plugin' class='select form-control' name='plugin'>
-                    <option value='' title='{% trans "Export to PDF" %}'>{% trans "Export to PDF" %}</option>
         `;
 
         plugins.forEach(function(plugin) {
-            plugin_selection += `<option value='${plugin.key}' title='${plugin.meta.human_name}'>${plugin.name} - <small>${plugin.meta.human_name}</small></option>`;
+            var selected = '';
+            if (user_settings['LABEL_DEFAULT_PRINTER'] == plugin.key) {
+                selected = ' selected';
+            }
+            plugin_selection += `<option value='${plugin.key}' title='${plugin.meta.human_name}'${selected}>${plugin.name} - <small>${plugin.meta.human_name}</small></option>`;
         });
 
         plugin_selection += `
@@ -273,7 +74,6 @@ function selectLabel(labels, items, options={}) {
     }
 
     var modal = options.modal || '#modal-form';
-
     var label_list = makeOptionsList(
         labels,
         function(item) {
@@ -287,6 +87,16 @@ function selectLabel(labels, items, options={}) {
         },
         function(item) {
             return item.pk;
+        },
+        null,
+        function(item) {
+            if (options.key == 'part')
+                return item.pk == user_settings.DEFAULT_PART_LABEL_TEMPLATE;
+            else if (options.key == 'location')
+                return item.pk == user_settings.DEFAULT_LOCATION_LABEL_TEMPLATE;
+            else if (options.key == 'item')
+                return item.pk == user_settings.DEFAULT_ITEM_LABEL_TEMPLATE;
+            return '';
         }
     );
 
@@ -294,10 +104,10 @@ function selectLabel(labels, items, options={}) {
     var html = '';
 
     if (items.length > 0) {
-
+        let item_name = items.length == 1 ? options.singular_name : options.plural_name;
         html += `
         <div class='alert alert-block alert-info'>
-        ${items.length} {% trans "stock items selected" %}
+        ${items.length} ${item_name} {% trans "selected" %}
         </div>`;
     }
 
@@ -321,6 +131,7 @@ function selectLabel(labels, items, options={}) {
     });
 
     modalEnable(modal, true);
+    modalShowSubmitButton(modal, true);
     modalSetTitle(modal, '{% trans "Select Label Template" %}');
     modalSetContent(modal, html);
 
@@ -338,6 +149,78 @@ function selectLabel(labels, items, options={}) {
                 // Return the selected label template and plugin
                 label: label,
                 plugin: plugin,
+            });
+        }
+    });
+}
+
+
+/*
+ *  Print label(s) for the selected items:
+ *
+ * - Retrieve a list of matching label templates from the server
+ * - Present the available templates to the user (if more than one available)
+ * - Request printed labels
+ *
+ * Required options:
+ * - url: The list URL for the particular template type
+ * - items: The list of items to be printed
+ * - key: The key to use in the query parameters
+ */
+function printLabels(options) {
+
+    if (!options.items || options.items.length == 0) {
+        showAlertDialog(
+            '{% trans "Select Items" %}',
+            '{% trans "No items selected for printing" %}',
+        );
+        return;
+    }
+
+    let params = {
+        enabled: true,
+    };
+
+    params[options.key] = options.items;
+
+    // Request a list of available label templates
+    inventreeGet(options.url, params, {
+        success: function(response) {
+            if (response.length == 0) {
+                showAlertDialog(
+                    '{% trans "No Labels Found" %}',
+                    '{% trans "No label templates found which match the selected items" %}',
+                );
+                return;
+            }
+
+            // Select label template for printing
+            selectLabel(response, options.items, {
+                success: function(data) {
+                    let href = `${options.url}${data.label}/print/?`;
+
+                    options.items.forEach(function(item) {
+                        href += `${options.key}=${item}&`;
+                    });
+
+                    href += `plugin=${data.plugin}`;
+
+                    inventreeGet(href, {}, {
+                        success: function(response) {
+                            if (response.file) {
+                                // Download the generated file
+                                window.open(response.file);
+                            } else {
+                                showMessage('{% trans "Labels sent to printer" %}', {
+                                    style: 'success',
+                                });
+                            }
+                        }
+                    });
+                },
+                plural_name: options.plural_name,
+                singular_name: options.singular_name,
+                key: options.key,
             });
         }
     });
